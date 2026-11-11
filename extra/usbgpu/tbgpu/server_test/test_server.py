@@ -225,4 +225,63 @@ class TestMapFd(ServerCase):
       self.assertEqual(st, 0)
       self.assertEqual(c.rpc(UNMAP_SYSMEM, idx)[:2], (0, 64 * MIB))
 
+PRELUDE = """
+import _posixshmem, os
+from extra.hcq1.remote import APLRemotePCIDevice
+APLRemotePCIDevice.ensure_app = classmethod(lambda cls: None) # the TinyGPU.app is not needed, the server under test is already running
+d = APLRemotePCIDevice("AM", "usb4")
+"""
+
+class TestAPLRemotePCIDevice(ServerCase): # extra/hcq1/remote.py against the real server.c
+  def run_client(self, code:str, **env:str):
+    self.start(**env).close()
+    root = os.path.abspath(os.path.join(HERE, "..", "..", "..", ".."))
+    r = subprocess.run([sys.executable, "-c", PRELUDE + code], env=dict(os.environ, APL_REMOTE_SOCK=self.path, TMPDIR=self.tmp, PYTHONPATH=root),
+                       capture_output=True, text=True, cwd=root) # own TMPDIR: the client's lock file cannot collide with a card session
+    self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+
+  def test_free_sysmem_returns_the_aperture(self):
+    self.run_client("""
+a, pages = d.alloc_sysmem(30 << 20)
+assert pages[0] == 0x80000000 and d.blocks == {a.addr: 0}
+b, _ = d.alloc_sysmem(30 << 20)  # 60 of the 64 MiB of the mock dext's aperture
+assert d.free_sysmem(a) and d.can_release and list(d.blocks.values()) == [1]
+c, _ = d.alloc_sysmem(30 << 20)  # does not fit unless a was given back; takes its index
+assert sorted(d.blocks.values()) == [0, 1] and d.free_sysmem(b) and d.free_sysmem(c) and not d.blocks
+""", MOCK_ARENA_MIB="64")
+
+  def test_map_fd(self):
+    self.run_client("""
+import mmap
+name = f"/tgs{os.getpid()}"
+fd = _posixshmem.shm_open(name, os.O_CREAT | os.O_RDWR, 0o600)
+_posixshmem.shm_unlink(name)
+os.ftruncate(fd, 64 << 20)
+mm = mmap.mmap(fd, 64 << 20)
+mm[:4] = b"data"
+for _ in range(5):  # a full aperture each time
+  block, pages = d.map_fd(fd, 0, 64 << 20)
+  assert len(pages) == (64 << 20) // 0x1000 and pages[0] == 0x80000000
+  assert d.unmap_fd(block)
+assert mm[:4] == b"data"  # nothing was written into the client's memory
+try: d.map_fd(fd, 0x1000, 0x4000); raise SystemExit("unaligned offset accepted")
+except RuntimeError: pass
+""", MOCK_ARENA_MIB="64")
+
+  def test_dext_without_release_dma(self):
+    self.run_client("""
+a, _ = d.alloc_sysmem(8 << 20)
+assert not d.free_sysmem(a) and not d.can_release and a.addr in d.blocks
+a[0:4] = b"live"  # the block is still mapped
+assert a[0:4] == b"live" and not d.free_sysmem(a)  # and not asked again
+""", MOCK_OLD_DEXT="1")
+
+  def test_refused_release_keeps_the_block(self):
+    self.run_client("""
+a, _ = d.alloc_sysmem(8 << 20)
+try: d.free_sysmem(a); raise SystemExit("refusal not reported")
+except RuntimeError as e: assert "refused" in str(e)
+assert a.addr in d.blocks and d.can_release and d.free_sysmem(a)
+""", MOCK_FAIL_RELEASE="1")
+
 if __name__ == "__main__": unittest.main()
