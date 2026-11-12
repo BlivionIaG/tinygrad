@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # Runs the REAL extra/usbgpu/tbgpu/installer/Shared/server.c (built against mock_iokit.c, no dext, no GPU, macOS only) and speaks the wire
 # protocol to it: MAP_SYSMEM_FD / UNMAP_SYSMEM / MAP_FD, the 128 live block limit, a dext without ReleaseDMA, a refused release, the DMA arena
-# cap, cleanup on disconnect, RESET_LINK (the GPU's nub, failures, an old dext), and
+# cap, cleanup on disconnect, RESET_LINK (the registry walk to the bridge dexts, the reset ladder, failures, an old dext), and
 # extra/hcq1/remote.py's APLRemotePCIDevice against it.
 #   python3 extra/usbgpu/tbgpu/server_test/test_server.py
 import _posixshmem, array, glob, mmap, os, shutil, socket, struct, subprocess, sys, tempfile, time, unittest
@@ -236,69 +236,129 @@ class TestResetLink(ServerCase):
     if not os.path.exists(self.log): return []
     with open(self.log) as f: return [tuple(map(int, l.split())) for l in f]  # type: ignore[misc]
 
-  def test_query(self):
-    c = self.start()
-    self.assertEqual(c.rpc(RESET_LINK, 0, 0, 0), (0, 0, 1))  # no level above the GPU
-    self.assertEqual(c.rpc(RESET_LINK, 3, 0, 1), (0, 0, 1))  # level and options mean nothing to a query
-    self.assertEqual(self.calls(), [])  # nothing was reset
+  def idle(self, c:Client): # the server holds nothing (no bridge connection, no registry object) and still serves
+    self.assertEqual(c.rpc(CFG_READ, 0xF000, 4)[:2], (0, 0), "a bridge connection is still open")
+    self.assertEqual(c.rpc(CFG_READ, 0xF004, 4)[:2], (0, 0), "a registry object was not released")
+    self.assertEqual(c.rpc(CFG_READ, 0xF008, 4)[:2], (0, 0), "a release or close that matched nothing")
     self.assertEqual(c.rpc(CFG_READ, 0, 2)[:2], (0, 0x1002))
+
+  def test_query(self):
+    for n in (0, 1, 2, 4):
+      with self.subTest(bridges=n):
+        c = self.start(MOCK_BRIDGES=str(n))
+        self.assertEqual(c.rpc(RESET_LINK, 0, 0, 0), (0, n, 1))
+        self.assertEqual(c.rpc(RESET_LINK, 3, 0, 1), (0, n, 1))  # level and options mean nothing to a query
+        self.assertEqual(self.calls(), [])  # nothing was reset, no bridge user client was even opened
+        self.idle(c)
+        c.close()
+    c = self.start()  # four bridge dexts by default
+    self.assertEqual(c.rpc(RESET_LINK), (0, 4, 1))
 
   def test_level0(self):
-    c = self.start()
-    for typ in (HOT_RESET, WARM_RESET, FUNCTION_RESET): self.assertEqual(c.rpc(RESET_LINK, 0, typ, 0), (0, 0, 1))
-    self.assertEqual(self.calls(), [(0, HOT_RESET, 0), (0, WARM_RESET, 0), (0, FUNCTION_RESET, 0)])
-    self.assertEqual(c.rpc(CFG_READ, 0, 2)[:2], (0, 0x1002))
+    for n in (0, 4):  # the GPU's own nub needs no bridge dext
+      c = self.start(MOCK_BRIDGES=str(n))
+      for typ in (HOT_RESET, WARM_RESET, FUNCTION_RESET): self.assertEqual(c.rpc(RESET_LINK, 0, typ, 0), (0, 0, 1))
+      self.assertEqual(self.calls(), [(0, HOT_RESET, 0), (0, WARM_RESET, 0), (0, FUNCTION_RESET, 0)])
+      self.idle(c)
+      c.close()
 
-  def test_levels_above_the_gpu_are_not_there(self):
+  def test_each_level_reaches_its_bridge(self):
     c = self.start()
-    for k in (1, 4, 32, 33, 1 << 32, 1 << 40): self.assertEqual(c.rpc(RESET_LINK, k, HOT_RESET, 0), (1, KR_NO_DEVICE, 1))
+    for k in range(1, 5):
+      self.assertEqual(c.rpc(RESET_LINK, k, HOT_RESET, 0), (0, 0, 1))
+      self.assertEqual(self.calls()[-1], (k, HOT_RESET, 0))
+      self.idle(c)  # closed again right after the call
+    self.assertEqual(c.rpc(RESET_LINK, 2, WARM_RESET, 0), (0, 0, 1))
+    self.assertEqual(c.rpc(RESET_LINK, 0, HOT_RESET, 0), (0, 0, 1))
+    self.assertEqual(self.calls(), [(1, 1, 0), (2, 1, 0), (3, 1, 0), (4, 1, 0), (2, 2, 0), (0, 1, 0)])
+    self.idle(c)
+
+  def test_level_without_bridge_dext(self):
+    c = self.start()
+    for k in (5, 6, 31, 32, 33, 1 << 32, 1 << 40): self.assertEqual(c.rpc(RESET_LINK, k, HOT_RESET, 0), (1, KR_NO_DEVICE, 1))
     self.assertEqual(self.calls(), [])
+    self.idle(c)
+    c.close()
+    c = self.start(MOCK_BRIDGES="2")  # bridge dexts only on the two nubs nearest the GPU
+    self.assertEqual([c.rpc(RESET_LINK, k, HOT_RESET, 0) for k in range(1, 5)], [(0, 0, 1), (0, 0, 1), (1, KR_NO_DEVICE, 1), (1, KR_NO_DEVICE, 1)])
+    self.assertEqual(self.calls(), [(1, 1, 0), (2, 1, 0)])
+    self.idle(c)
+    c.close()
+    c = self.start(MOCK_BRIDGES="0")  # a dext without the bridge personality (the release build)
+    self.assertEqual(c.rpc(RESET_LINK, 1, HOT_RESET, 0), (1, KR_NO_DEVICE, 1))
+    self.assertEqual(c.rpc(RESET_LINK, 0, HOT_RESET, 0), (0, 0, 1))
+    self.idle(c)
 
   def test_failures(self):
     c = self.start(MOCK_RESET_KR=hex(KR_BUSY))
-    self.assertEqual(c.rpc(RESET_LINK, 0, HOT_RESET, 0), (1, KR_BUSY, 1))  # what Reset returned, unchanged
-    self.assertEqual(self.calls(), [(0, 1, 0)])
+    for k in (0, 1, 4): self.assertEqual(c.rpc(RESET_LINK, k, HOT_RESET, 0), (1, KR_BUSY, 1))  # what Reset returned, unchanged
+    self.assertEqual(self.calls(), [(0, 1, 0), (1, 1, 0), (4, 1, 0)])
+    self.idle(c)
+    c.close()
+    c = self.start(MOCK_RESET_KR_LEVEL2=hex(KR_BAD_ARG))
+    self.assertEqual([c.rpc(RESET_LINK, k, HOT_RESET, 0) for k in range(4)], [(0, 0, 1), (0, 0, 1), (1, KR_BAD_ARG, 1), (0, 0, 1)])
+    self.idle(c)
+    c.close()
+    c = self.start(MOCK_OPEN_KR_LEVEL3="0xE00002CD")  # the bridge user client does not open: its IOServiceOpen error
+    self.assertEqual(c.rpc(RESET_LINK, 3, HOT_RESET, 0), (1, 0xE00002CD, 1))
+    self.assertEqual(c.rpc(RESET_LINK, 4, HOT_RESET, 0), (0, 0, 1))
+    self.assertEqual(self.calls(), [(4, 1, 0)])
+    self.idle(c)
     c.close()
     c = self.start()
     for typ, opt in ((1 << 32, 0), (1, 1 << 32), (1 << 63, 1 << 63)): self.assertEqual(c.rpc(RESET_LINK, 0, typ, opt), (1, KR_BAD_ARG, 1))  # the dext takes 32 bits
     self.assertEqual(self.calls(), [])
+    self.idle(c)
+
+  def test_type_zero_never_resets(self):
+    c = self.start()
+    for k in range(0, 8):
+      for opt in (0, TERMINATE, 0xFF): self.assertEqual(c.rpc(RESET_LINK, k, 0, opt), (0, 4, 1))
+    self.assertEqual(self.calls(), [])
+    self.idle(c)
 
   def test_terminate_option_is_passed_through(self):
     c = self.start()
-    self.assertEqual(c.rpc(RESET_LINK, 0, HOT_RESET, TERMINATE), (0, 0, 1))
-    self.assertEqual(c.rpc(RESET_LINK, 0, WARM_RESET, 0xA5), (0, 0, 1))
-    self.assertEqual(self.calls(), [(0, 1, 1), (0, 2, 0xA5)])
-    self.assertEqual(c.rpc(CFG_READ, 0, 2)[:2], (0, 0x1002))  # the mock does not terminate anything here: the server keeps serving
+    for k in (0, 3): self.assertEqual(c.rpc(RESET_LINK, k, HOT_RESET, TERMINATE), (0, 0, 1))
+    self.assertEqual(c.rpc(RESET_LINK, 1, WARM_RESET, 0xA5), (0, 0, 1))
+    self.assertEqual(self.calls(), [(0, 1, 1), (3, 1, 1), (1, 2, 0xA5)])
+    self.idle(c)  # the mock does not terminate anything here: the server keeps serving
 
   def test_terminate_notification_during_the_reset_exits_after_the_answer(self):
-    c = self.start(MOCK_TERMINATE_NOTIFY="1")  # the dext terminates while Reset runs: the server answers first, then exits
-    self.assertEqual(c.rpc(RESET_LINK, 0, HOT_RESET, TERMINATE), (0, 0, 1))
-    self.assertEqual(c.s.recv(1), b"")  # the connection closes
-    self.assertEqual(self.proc.wait(10), 0)
-    self.assertEqual(self.calls(), [(0, 1, 1)])
-    c.close()
+    for k in (0, 2):
+      c = self.start(MOCK_TERMINATE_NOTIFY="1")  # the dext terminates while Reset runs: the server answers first, then exits
+      self.assertEqual(c.rpc(RESET_LINK, k, HOT_RESET, TERMINATE), (0, 0, 1))
+      self.assertEqual(c.s.recv(1), b"")  # the connection closes
+      self.assertEqual(self.proc.wait(10), 0)
+      self.assertEqual(self.calls(), [(k, 1, 1)])
+      c.close()
     c = self.start(MOCK_TERMINATE_NOTIFY="1")  # no terminate option, no termination: still alive
     self.assertEqual(c.rpc(RESET_LINK, 0, HOT_RESET, 0), (0, 0, 1))
-    self.assertEqual(c.rpc(CFG_READ, 0, 2)[:2], (0, 0x1002))
+    self.idle(c)
 
   def test_old_dext(self):
-    c = self.start(MOCK_OLD_DEXT="1")  # a GPU dext without ResetLink
+    c = self.start(MOCK_OLD_DEXT="1")  # a GPU dext without ResetLink and without bridge dexts
     self.assertEqual(c.rpc(RESET_LINK), (0, 0, 1))
     self.assertEqual(c.rpc(RESET_LINK, 0, HOT_RESET, 0), (1, KR_UNSUPPORTED, 1))
+    self.assertEqual(c.rpc(RESET_LINK, 1, HOT_RESET, 0), (1, KR_NO_DEVICE, 1))
     self.assertEqual(self.calls(), [])
+    self.idle(c)
 
   def test_after_other_traffic(self):
     c = self.start()
     st, idx, mm, _ = c.map_sysmem(2 * MIB)
     self.assertEqual((st, idx), (0, 0))
     self.assertEqual(c.rpc(MAP_BAR, bar=0)[0], 0)
-    self.assertEqual(c.rpc(RESET_LINK, 0, HOT_RESET, 0), (0, 0, 1))
+    self.assertEqual(c.rpc(RESET_LINK, 1, HOT_RESET, 0), (0, 0, 1))
     self.assertEqual(c.rpc(UNMAP_SYSMEM, idx), (0, 2 * MIB, 1))  # the DMA state is untouched by a reset request
+    self.assertEqual(c.rpc(RESET_LINK, 0, HOT_RESET, 0), (0, 0, 1))
     self.assertEqual(c.map_sysmem(MIB)[:2], (0, 0))
-    self.assertEqual(c.rpc(RESET_LINK), (0, 0, 1))
+    self.assertEqual(c.rpc(RESET_LINK), (0, 4, 1))
+    self.idle(c)
     c.close()
     c = self.start()  # a new client after the old one left
-    self.assertEqual(c.rpc(RESET_LINK, 0, HOT_RESET, 0), (0, 0, 1))
+    self.assertEqual(c.rpc(RESET_LINK, 4, HOT_RESET, 0), (0, 0, 1))
+    self.idle(c)
 
 PRELUDE = """
 import _posixshmem, os
