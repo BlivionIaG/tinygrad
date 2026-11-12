@@ -7,6 +7,7 @@ from tinygrad.runtime.support.system import PCIDevice, System
 
 class RemoteCmd(enum.IntEnum):
   PROBE,MAP_BAR,MAP_SYSMEM_FD,CFG_READ,CFG_WRITE,RESET,MMIO_READ,MMIO_WRITE,MAP_SYSMEM,SYSMEM_READ,SYSMEM_WRITE,RESIZE_BAR,PING = range(13)
+  UNMAP_SYSMEM,MAP_FD = 15,16 # TinyGPU server only (13 and 14 are LOAD_PROG and EXEC_PROG of extra/remote/serve.py)
 
 class RemoteMMIOInterface(MMIOInterface):
   def __init__(self, dev:RemotePCIDevice, residx:int, nbytes:int, fmt='B', off=0, rd_cmd=RemoteCmd.MMIO_READ, wr_cmd=RemoteCmd.MMIO_WRITE):
@@ -112,6 +113,7 @@ class RemotePCIDevice(PCIDevice):
 
 class APLRemotePCIDevice(RemotePCIDevice):
   APP_PATH = "/Applications/TinyGPU.app/Contents/MacOS/TinyGPU"
+  KR_UNSUPPORTED = 0xE00002C7 # kern_return_t of a dext without ReleaseDMA
 
   @classmethod
   def ensure_app(cls):
@@ -134,11 +136,43 @@ class APLRemotePCIDevice(RemotePCIDevice):
       time.sleep(0.05)
     else: raise RuntimeError(f"Failed to connect to TinyGPU server at {sock_path}.")
     super().__init__(devpref, "usb4", sock=sock)
+    self.blocks, self.can_release = {}, True # blocks: address of the view alloc_sysmem returned -> the server's index of its DMA block
 
   def alloc_sysmem(self, size:int, vaddr:int=0, contiguous:bool=False) -> tuple[MMIOInterface, list[int]]:
-    mapped_size, _, _, fd = self._rpc(self.sock, self.dev_id, RemoteCmd.MAP_SYSMEM_FD, size, int(contiguous), has_fd=True)
+    mapped_size, block, _, fd = self._rpc(self.sock, self.dev_id, RemoteCmd.MAP_SYSMEM_FD, size, int(contiguous), has_fd=True)
     memview = MMIOInterface(FileIOInterface(fd=fd).mmap(0, mapped_size, mmap.PROT_READ | mmap.PROT_WRITE, mmap.MAP_SHARED, 0), mapped_size, fmt='B')
+    self.blocks[memview.addr] = block
 
     # paddrs are returned as (paddr, size) pairs until a (paddr=0, size=0) terminator in the beginning of the mapping.
     paddrs_raw = list(itertools.takewhile(lambda p: p[1] != 0, zip(memview.view(fmt='Q')[0::2], memview.view(fmt='Q')[1::2])))
     return memview, [p + i for p, sz in paddrs_raw for i in range(0, sz, 0x1000)][:ceildiv(size, 0x1000)]
+
+  # Giving DMA memory back (needs a dext and server with ReleaseDMA, see the comment block in installer/Shared/server.c). The caller must have
+  # fenced every engine that can touch the block and removed the device's own mappings of it: after UNMAP the IOMMU faults on an access.
+  def _unmap_block(self, block:int) -> bool:
+    self.sock.sendall(struct.pack('<BIIQQQ', RemoteCmd.UNMAP_SYSMEM, self.dev_id, 0, block, 0, 0))
+    status, resp0, resp1 = struct.unpack('<BQQ', self._recvall(self.sock, 17))
+    if not status: return True
+    # an old server answers (1, 0, 0), a dext without ReleaseDMA kIOReturnUnsupported: not asked again. Else the block stays live.
+    if not resp1 or resp0 == self.KR_UNSUPPORTED: self.can_release = False
+    else: raise RuntimeError(f"TinyGPU server refused to unmap DMA block {block}: kern_return {resp0:#x}")
+    return False
+
+  def free_sysmem(self, view:MMIOInterface) -> bool:
+    """Gives the block of `view` (what alloc_sysmem returned, a whole block) back to the dext and unmaps it here. False if the server can't."""
+    if not self.can_release or (block:=self.blocks.get(view.addr)) is None or not self._unmap_block(block): return False
+    del self.blocks[view.addr]
+    FileIOInterface.munmap(view.addr, view.nbytes)
+    return True
+
+  def map_fd(self, fd:int, offset:int, size:int) -> tuple[int, list[int]]:
+    """DMA maps [offset, offset + size) (multiples of 16 KiB) of a shared memory object the caller owns, nothing is written into it.
+    Returns the server's block index (for unmap_fd) and the DMA address of every 4 KiB page."""
+    msg = struct.pack('<BIIQQQ', RemoteCmd.MAP_FD, self.dev_id, 0, offset, size, 0)
+    self.sock.sendmsg([msg], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack('i', fd))])
+    status, _, block = struct.unpack('<BQQ', self._recvall(self.sock, 17)) # an old server answers (1, 0, 0)
+    if status: raise RuntimeError(f"TinyGPU server could not DMA map {size:#x} bytes at {offset:#x} of fd {fd}")
+    nseg, = struct.unpack('<Q', self._recvall(self.sock, 8)) # then nseg (paddr, size) pairs
+    tab = array.array('Q', self._recvall(self.sock, 16 * nseg))
+    return block, [p + i for p, sz in zip(tab[0::2], tab[1::2]) for i in range(0, sz, 0x1000)][:ceildiv(size, 0x1000)]
+  def unmap_fd(self, block:int) -> bool: return self.can_release and self._unmap_block(block)
