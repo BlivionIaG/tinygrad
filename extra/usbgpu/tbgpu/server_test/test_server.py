@@ -4,7 +4,7 @@
 # cap, cleanup on disconnect, RESET_LINK (the registry walk to the bridge dexts, the reset ladder, failures, an old dext), and
 # extra/hcq1/remote.py's APLRemotePCIDevice against it.
 #   python3 extra/usbgpu/tbgpu/server_test/test_server.py
-import _posixshmem, array, glob, mmap, os, shutil, socket, struct, subprocess, sys, tempfile, time, unittest
+import _posixshmem, array, ctypes, glob, mmap, os, shutil, socket, struct, subprocess, sys, tempfile, time, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SERVER_C = os.path.join(HERE, "..", "installer", "Shared", "server.c")
@@ -13,19 +13,22 @@ MAP_BAR, MAP_SYSMEM_FD, CFG_READ, MMIO_READ, MMIO_WRITE, UNMAP_SYSMEM, MAP_FD, R
 KR_NO_MEMORY, KR_NO_DEVICE, KR_BAD_ARG, KR_UNSUPPORTED, KR_BUSY = 0xE00002BD, 0xE00002C0, 0xE00002C2, 0xE00002C7, 0xE00002D5
 HOT_RESET, WARM_RESET, FUNCTION_RESET, TERMINATE = 1, 2, 0x10, 1
 MAGIC, PAGE, MIB = 0x52454C444D410001, 16384, 1 << 20
-FEATURES = 18
-FEAT_FEATURES, FEAT_READ_1SEND, FEAT_WC_BAR0, FEAT_QOS_SPIN, PROTO_VERSION = 1, 2, 4, 8, 1
+FEATURES, RING_SETUP, RING_KICK = 18, 19, 20
+FEAT_FEATURES, FEAT_READ_1SEND, FEAT_WC_BAR0, FEAT_QOS_SPIN, FEAT_RING, PROTO_VERSION = 1, 2, 4, 8, 16, 1
+RING_MAGIC, RING_REQ_HEAD, RING_REQ_TAIL, RING_RSP_HEAD, RING_RSP_TAIL, RING_SRV_STATE = 0x5447524E47000001, 128, 256, 384, 512, 640
+MEMORY_BARRIER = ctypes.CDLL(None).OSMemoryBarrier  # a full dmb: python's own stores and loads are not ordered against another process
 
-def build(dst:str):
-  srcs = [os.path.join(HERE, "mock_iokit.c"), os.path.join(HERE, "mock_main.c")]
+def compile_c(args:list[str]) -> bool:
   clt = "/Library/Developer/CommandLineTools"
   sdks = sorted(glob.glob(f"{clt}/SDKs/MacOSX*.sdk"))
   tries = [["xcrun", "clang"]]
   if sdks: tries.append([f"{clt}/usr/bin/clang", "-isysroot", sdks[-1]]) # works while the Xcode license is not accepted
-  def run(cc, args) -> bool: return subprocess.run([*cc, "-O1", *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
-  for cc in tries:
-    obj = dst + ".server.o"  # server.c alone is built with mock_sys.h: it counts the sends the server makes
-    if run(cc, ["-c", "-include", os.path.join(HERE, "mock_sys.h"), "-o", obj, SERVER_C]) and run(cc, ["-o", dst, obj, *srcs]): return
+  return any(subprocess.run([*cc, "-O2", *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0 for cc in tries)
+
+def build(dst:str):
+  srcs = [os.path.join(HERE, "mock_iokit.c"), os.path.join(HERE, "mock_main.c")]
+  obj = dst + ".server.o"  # server.c alone is built with mock_sys.h: it counts the sends the server makes
+  if compile_c(["-c", "-include", os.path.join(HERE, "mock_sys.h"), "-o", obj, SERVER_C]) and compile_c(["-o", dst, obj, *srcs]): return
   raise RuntimeError("cannot build server.c with the mock IOKit")
 
 class Client:
@@ -437,7 +440,7 @@ class TestFeatures(ServerCase):
   def test_features_answer(self):
     st, reg, f = self.start().rpc(FEATURES, PROTO_VERSION)
     self.assertEqual((st, reg, f >> 32), (0, 0x100000a5c, 1))
-    self.assertEqual(f & 0xFFFFFFFF, FEAT_FEATURES | FEAT_READ_1SEND | FEAT_WC_BAR0 | FEAT_QOS_SPIN)
+    self.assertEqual(f & 0xFFFFFFFF, FEAT_FEATURES | FEAT_READ_1SEND | FEAT_WC_BAR0 | FEAT_QOS_SPIN | FEAT_RING)
 
   def test_features_registry_id_unknown(self):
     self.assertEqual(self.start(MOCK_REG_ID="0").rpc(FEATURES, PROTO_VERSION)[1], 0)
@@ -445,7 +448,7 @@ class TestFeatures(ServerCase):
   def test_features_without_wc_in_the_dext(self):
     for env in ({"MOCK_NO_WC": "1"}, {"MOCK_OLD_DEXT": "1"}):  # a dext that does not know selector 6
       st, _, f = self.start(**env).rpc(FEATURES, PROTO_VERSION)
-      self.assertEqual((st, f & 0xFFFFFFFF), (0, FEAT_FEATURES | FEAT_READ_1SEND | FEAT_QOS_SPIN))
+      self.assertEqual((st, f & 0xFFFFFFFF), (0, FEAT_FEATURES | FEAT_READ_1SEND | FEAT_QOS_SPIN | FEAT_RING))
 
   def test_old_server_answer_means_no_features(self):  # what the client sees from a server that predates 18 (and what a command it does not know gets)
     self.assertEqual(self.start().rpc(99), (1, 0, 0))
@@ -487,5 +490,245 @@ class TestFeatures(ServerCase):
     self.addCleanup(c2.close)
     self.assertEqual(c2.rpc(MAP_BAR, bar=0)[0], 0)
     self.assertEqual(c2.rpc(CFG_READ, 0, 2)[1], 0x1002)
+
+class Ring:
+  """A ring client in Python (the C one, ring_stress.c, is the strict one: atomics and a real CAS). `size` / `magic` / `version` / `req_cap` can be wrong on purpose."""
+  HDR = 16384
+  def __init__(self, c:Client, req_cap=1 << 16, rsp_cap=1 << 16, size:int|None=None, magic=RING_MAGIC, version=1, data_off=16384):
+    self.c, self.req_cap, self.rsp_cap = c, req_cap, rsp_cap
+    self.bytes = self.HDR + req_cap + rsp_cap
+    name = f"/tgr{os.getpid()}_{time.monotonic_ns()}"
+    self.fd = _posixshmem.shm_open(name, os.O_CREAT | os.O_RDWR, 0o600)
+    _posixshmem.shm_unlink(name)
+    os.ftruncate(self.fd, size or self.bytes)
+    self.mm = mmap.mmap(self.fd, size or self.bytes)
+    struct.pack_into('<QIIII', self.mm, 0, magic, version, req_cap, rsp_cap, data_off)
+    self.head = self.tail = 0  # our request head, our response tail
+    # every shared word is read and written with ONE 64-bit access (struct.pack_into stores byte by byte: the server would see torn counters)
+    self.words = {off: ctypes.c_uint64.from_buffer(self.mm, off) for off in (RING_REQ_HEAD, RING_REQ_TAIL, RING_RSP_HEAD, RING_RSP_TAIL, RING_SRV_STATE)}
+
+  def setup(self, fd:int|None=None) -> tuple[int, int, int]: return self.c.rpc(RING_SETUP, self.bytes, fd=self.fd if fd is None else fd)
+  def word(self, off:int) -> int: return self.words[off].value
+  def srv_state(self) -> int: return self.word(RING_SRV_STATE)
+  def close(self):
+    self.words = {}  # the views pin the mmap
+    self.mm.close(); os.close(self.fd)
+
+  def put(self, data:bytes):
+    mv, h, t0 = memoryview(data), self.head, time.monotonic()
+    while len(mv):
+      space = self.req_cap - (h - self.word(RING_REQ_TAIL))
+      if not space:
+        self.publish(h)
+        if time.monotonic() - t0 > 20: raise TimeoutError("request ring stuck")
+        continue
+      k = min(space, len(mv))
+      pos = h & (self.req_cap - 1)
+      first = min(k, self.req_cap - pos)
+      base = self.HDR
+      self.mm[base + pos:base + pos + first] = mv[:first]
+      self.mm[base:base + k - first] = mv[first:k]
+      h, mv, t0 = h + k, mv[k:], time.monotonic()
+    self.publish(h)
+
+  def publish(self, h:int):
+    self.head = h
+    MEMORY_BARRIER()  # the data before the head (release), the head before the look at srv_state (Dekker)
+    self.words[RING_REQ_HEAD].value = h
+    MEMORY_BARRIER()
+    if self.srv_state() == 1:  # the server sleeps: one kick
+      self.words[RING_SRV_STATE].value = 2
+      self.c.s.sendall(struct.pack(REQ, RING_KICK, 0, 0, 0, 0, 0))
+
+  def get(self, n:int) -> bytes:
+    out, t0 = b"", time.monotonic()
+    while len(out) < n:
+      avail = self.word(RING_RSP_HEAD) - self.tail
+      if not avail:
+        if time.monotonic() - t0 > 20: raise TimeoutError("no answer on the response ring")
+        continue
+      MEMORY_BARRIER()
+      k = min(avail, n - len(out))
+      pos = self.tail & (self.rsp_cap - 1)
+      first = min(k, self.rsp_cap - pos)
+      base = self.HDR + self.req_cap
+      out += bytes(self.mm[base + pos:base + pos + first]) + bytes(self.mm[base:base + k - first])
+      self.tail += k
+      self.words[RING_RSP_TAIL].value = self.tail
+      t0 = time.monotonic()
+    return out
+
+  def answer(self, cmd:int, a0=0, a1=0, a2=0, bar=0, payload=b"") -> tuple[int, int, int]:
+    self.put(struct.pack(REQ, cmd, 0, bar, a0, a1, a2) + payload)
+    return struct.unpack(RESP, self.get(struct.calcsize(RESP)))
+
+  def write(self, bar:int, off:int, data:bytes): self.put(struct.pack(REQ, MMIO_WRITE, 0, bar, off, len(data), 0) + data)
+  def read(self, bar:int, off:int, n:int) -> bytes:
+    st, r0, _ = self.answer(MMIO_READ, off, n, bar=bar)
+    assert (st, r0) == (0, n), (st, r0)
+    return self.get(n)
+
+class TestRing(ServerCase):
+  def ring(self, c:Client, **kw) -> Ring:
+    r = Ring(c, **kw)
+    self.addCleanup(r.close)
+    return r
+
+  def up(self, **env:str) -> tuple[Client, Ring]:
+    c = self.start(**env)
+    r = self.ring(c)
+    self.assertEqual(r.setup(), (0, r.bytes, 1))
+    self.assertEqual(c.rpc(MAP_BAR, bar=0)[0], 0)
+    return c, r
+
+  def test_features_say_ring(self):
+    self.assertTrue(self.start().rpc(FEATURES, PROTO_VERSION)[2] & FEAT_RING)
+
+  def test_roundtrip_and_ordering(self):
+    c, r = self.up()
+    self.assertEqual(r.answer(CFG_READ, 0, 2), (0, 0x1002, 0))
+    for i in range(300):
+      d = struct.pack('<I', i * 77)
+      r.write(0, 4 * i, d)
+      self.assertEqual(r.read(0, 4 * i, 4), d)  # a read sees every write posted before it
+    r.write(0, 0x1000, b"abcdefgh")
+    self.assertEqual(r.read(0, 0x1000, 8), b"abcdefgh")
+
+  def test_payloads_longer_than_the_ring(self):
+    c = self.start()
+    r = self.ring(c, req_cap=4096, rsp_cap=4096)
+    self.assertEqual(r.setup()[0], 0)
+    c.rpc(MAP_BAR, bar=0)
+    pattern = bytes((i * 31 + (i >> 8)) & 0xFF for i in range(1 << 20))
+    r.write(0, 0, pattern)
+    self.assertEqual(r.read(0, 0, 1 << 20), pattern)
+
+  def test_unsupported_commands_are_refused_on_the_ring(self):
+    c, r = self.up()
+    for cmd in (MAP_BAR, FEATURES, MAP_SYSMEM_FD, RESET_LINK, 99): self.assertEqual(r.answer(cmd), (1, 0, 0))
+    self.assertEqual(r.answer(MMIO_READ, 1 << 30, 4), (1, 0, 0))  # out of the BAR: refused like on the socket, no data
+    self.assertEqual(len(r.read(0, 0, 4)), 4)  # and the ring still works
+
+  def test_socket_request_sees_earlier_ring_writes(self):
+    c, r = self.up()
+    r.write(0, 0x200, b"wxyz")
+    c.s.sendall(struct.pack(REQ, MMIO_READ, 0, 0, 0x200, 4, 0))  # the legacy path, right behind the ring entry
+    self.assertEqual(struct.unpack(RESP, c.recvall(17))[:2], (0, 4))
+    self.assertEqual(c.recvall(4), b"wxyz")
+    self.assertEqual(c.rpc(FEATURES, PROTO_VERSION)[2] >> 32, 1)  # and the socket goes on working
+
+  def test_setup_refusals(self):
+    c = self.start()
+    good = dict(req_cap=4096, rsp_cap=4096)
+    cases = [
+      (dict(magic=1), KR_BAD_ARG), (dict(version=2), KR_BAD_ARG), (dict(data_off=4096), KR_BAD_ARG),
+      (dict(req_cap=3000, rsp_cap=4096), KR_BAD_ARG), (dict(req_cap=1024, rsp_cap=4096), KR_BAD_ARG), (dict(size=16384), KR_BAD_ARG),  # the object is smaller than the ring says
+    ]
+    for kw, kr in cases:
+      r = self.ring(c, **{**good, **kw})
+      self.assertEqual(r.setup(), (1, kr, 1), kw)
+      self.assertEqual(c.rpc(CFG_READ, 0, 2)[:2], (0, 0x1002))  # the connection is fine
+    r = self.ring(c, **good)
+    struct.pack_into('<Q', r.mm, RING_REQ_HEAD, 5)  # not fresh
+    self.assertEqual(r.setup(), (1, KR_BAD_ARG, 1))
+    self.assertEqual(c.rpc(RING_SETUP, 20000), (1, KR_BAD_ARG, 1))  # no fd
+    r = self.ring(c, **good)
+    self.assertEqual(r.setup(), (0, r.bytes, 1))
+    r2 = self.ring(c, **good)
+    self.assertEqual(r2.setup(), (1, KR_BUSY, 1))  # one ring per connection
+    self.assertEqual(r.answer(CFG_READ, 0, 2), (0, 0x1002, 0))
+
+  def test_a_new_connection_can_set_up_again(self):
+    c, r = self.up()
+    r.write(0, 0, b"keep")
+    c.close()
+    time.sleep(0.2)
+    c2 = Client(self.path)
+    self.addCleanup(c2.close)
+    r2 = self.ring(c2)
+    self.assertEqual(r2.setup(), (0, r2.bytes, 1))
+    c2.rpc(MAP_BAR, bar=0)
+    self.assertEqual(r2.read(0, 0, 4), b"keep")  # the posted write landed before the first connection went
+
+  def test_posted_writes_survive_eof(self):
+    c, r = self.up(TINYGPU_SPIN_US="0")  # asleep as soon as it is idle
+    time.sleep(0.1)
+    self.assertEqual(r.srv_state(), 1)
+    r.write(0, 0x300, b"EOF!" * 100)
+    c.close()  # the kick and the EOF arrive together
+    time.sleep(0.2)
+    c2 = Client(self.path)
+    self.addCleanup(c2.close)
+    r2 = self.ring(c2)
+    self.assertEqual(r2.setup()[0], 0)
+    c2.rpc(MAP_BAR, bar=0)
+    self.assertEqual(r2.read(0, 0x300, 400), b"EOF!" * 100)
+
+  def test_sleep_and_kick(self):
+    c, r = self.up(TINYGPU_SPIN_US="1")
+    for i in range(20):
+      time.sleep(0.02)
+      self.assertEqual(r.srv_state(), 1, "the server did not go to sleep")
+      r.write(0, 0x400, struct.pack('<I', i))
+      self.assertEqual(r.read(0, 0x400, 4), struct.pack('<I', i))
+      self.assertEqual(r.srv_state() in (0, 1, 2), True)
+
+  def test_default_ring_spin_then_sleep(self):
+    c, r = self.up()  # no TINYGPU_SPIN_US: the ring default (200 us) applies, so it is asleep after a pause
+    r.read(0, 0, 4)
+    time.sleep(0.1)
+    self.assertEqual(r.srv_state(), 1)
+
+  def test_counters_that_make_no_sense_drop_the_client(self):
+    for word, value in ((RING_REQ_HEAD, 3 * (1 << 16)), (RING_RSP_TAIL, 1 << 40)):
+      c, r = self.up()
+      r.words[word].value = value
+      if word == RING_RSP_TAIL: r.write(0, 0, bytes(4)); r.put(struct.pack(REQ, MMIO_READ, 0, 0, 0, 4, 0))  # the server wants to answer
+      with self.assertRaises((ConnectionError, TimeoutError, OSError)):
+        for _ in range(100): c.rpc(CFG_READ, 0, 2); time.sleep(0.01)  # the connection goes away
+      c.close()
+      time.sleep(0.2)
+      c2 = Client(self.path)  # the server itself is fine
+      self.addCleanup(c2.close)
+      self.assertEqual(c2.rpc(MAP_BAR, bar=0)[0], 0)
+      c2.close()
+      time.sleep(0.2)
+
+  def test_client_that_vanishes_mid_payload(self):
+    c, r = self.up()
+    r.put(struct.pack(REQ, MMIO_WRITE, 0, 0, 0, 1 << 20, 0) + bytes(1000))  # a megabyte promised, 1000 bytes sent
+    c.close()
+    time.sleep(0.3)
+    c2 = Client(self.path)  # the server must have noticed and gone on to the next client
+    self.addCleanup(c2.close)
+    self.assertEqual(c2.rpc(MAP_BAR, bar=0)[0], 0)
+
+class TestRingStress(ServerCase):
+  @classmethod
+  def setUpClass(cls):
+    super().setUpClass()
+    cls.stress = os.path.join(cls.tmp, "ring_stress")
+    if not compile_c(["-o", cls.stress, os.path.join(HERE, "ring_stress.c")]): raise RuntimeError("cannot build ring_stress.c")
+
+  def run_stress(self, iters:int, seed:int, caps:tuple[int, int], **env:str):
+    self.start(**env).close()  # the server serves one client at a time: let it go, the stress client takes its place
+    time.sleep(0.1)
+    dump = os.path.join(self.tmp, f"dump{seed}")
+    r = subprocess.run([self.stress, self.path, str(iters), str(seed), str(caps[0]), str(caps[1]), dump], capture_output=True, text=True, timeout=300)
+    self.assertEqual(r.returncode, 0, r.stderr + r.stdout)
+    time.sleep(0.2)  # the server serves the posted writes, then the next connection
+    c = Client(self.path)
+    self.addCleanup(c.close)
+    c.rpc(MAP_BAR, bar=0)
+    with open(dump, "rb") as f: expect = f.read()
+    c.s.sendall(struct.pack(REQ, MMIO_READ, 0, 0, 0, len(expect), 0))
+    self.assertEqual(struct.unpack(RESP, c.recvall(17))[:2], (0, len(expect)))
+    self.assertEqual(c.recvall(len(expect)), expect)  # what the client posted right before it closed is there
+    return r.stdout
+
+  def test_stress_sleepy_server(self): self.run_stress(20000, 1, (1 << 16, 1 << 16), TINYGPU_SPIN_US="20")
+  def test_stress_never_spins(self): self.run_stress(8000, 2, (1 << 16, 1 << 16), TINYGPU_SPIN_US="0")
+  def test_stress_tiny_rings(self): self.run_stress(8000, 3, (4096, 4096), TINYGPU_SPIN_US="5")
+  def test_stress_default_spin(self): self.run_stress(20000, 4, (1 << 14, 1 << 15))
 
 if __name__ == "__main__": unittest.main()
