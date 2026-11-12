@@ -32,6 +32,34 @@
 				<string>TinyGPUDriverUserClient</string>
 			</dict>
 		</dict>
+		<key>TinyGPUBridge</key>
+		<dict>
+			<key>CFBundleIdentifier</key>
+			<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+			<key>IOClass</key>
+			<string>IOUserService</string>
+			<key>IOMatchCategory</key>
+			<string>TinyGPUBridge</string>
+			<key>IOPCIPrimaryMatch</key>
+			<string>0x24611b21 0x14701022 0x14711022</string>
+			<key>IOPCITunnelCompatible</key>
+			<true/>
+			<key>IOProviderClass</key>
+			<string>IOPCIDevice</string>
+			<key>IOResourceMatch</key>
+			<string>IOKit</string>
+			<key>IOUserClass</key>
+			<string>TinyGPUBridge</string>
+			<key>IOUserServerName</key>
+			<string>org.tinygrad.tinygpu.Driver</string>
+			<key>TinyGPUBridgeUserClientProperties</key>
+			<dict>
+				<key>IOClass</key>
+				<string>IOUserUserClient</string>
+				<key>IOUserClass</key>
+				<string>TinyGPUBridgeUserClient</string>
+			</dict>
+		</dict>
 	</dict>
 </dict>
 </plist>

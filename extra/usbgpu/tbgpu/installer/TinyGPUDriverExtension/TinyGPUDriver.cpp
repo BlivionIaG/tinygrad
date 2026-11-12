@@ -192,6 +192,16 @@ kern_return_t TinyGPUDriver::ResetDevice()
 	return ret == kIOReturnSuccess ? ret : ivars->pci->Reset(kIOPCIDeviceResetTypeHotReset);
 }
 
+// Reset(type, options) on this nub: the secondary bus reset of its parent bridge, so it resets everything below that bridge. Needs no open session.
+// kIOPCIDeviceResetOptionTerminate (options & 1) has the kernel terminate the nubs below the bridge and re-probe the bus: this dext goes away with them.
+kern_return_t TinyGPUDriver::ResetLink(uint32_t type, uint32_t options)
+{
+	if (!ivars->pci) return kIOReturnNotReady;
+	kern_return_t ret = ivars->pci->Reset(type, options);
+	os_log(OS_LOG_DEFAULT, "tinygpu: ResetLink type=0x%x options=0x%x result=0x%08x", type, options, ret);
+	return ret;
+}
+
 IOPCIDevice* TinyGPUDriver::GetPCI()
 {
 	return ivars->pci;

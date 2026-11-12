@@ -22,6 +22,10 @@
 		C5C3BBB52612ACEF003C7BFE /* DriverKit.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = C5C3BBB42612ACEF003C7BFE /* DriverKit.framework */; };
 		C5D787AC261667FC006047E5 /* TinyGPUDriverUserClient.iig in Sources */ = {isa = PBXBuildFile; fileRef = C5D787AB261667FC006047E5 /* TinyGPUDriverUserClient.iig */; };
 		C5D787AE26168E59006047E5 /* TinyGPUDriverUserClient.cpp in Sources */ = {isa = PBXBuildFile; fileRef = C5D787AD26168D1E006047E5 /* TinyGPUDriverUserClient.cpp */; };
+		7B1D6E012F2A000000000011 /* TinyGPUBridge.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 7B1D6E012F2A000000000001 /* TinyGPUBridge.cpp */; };
+		7B1D6E012F2A000000000012 /* TinyGPUBridge.iig in Sources */ = {isa = PBXBuildFile; fileRef = 7B1D6E012F2A000000000002 /* TinyGPUBridge.iig */; };
+		7B1D6E012F2A000000000013 /* TinyGPUBridgeUserClient.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 7B1D6E012F2A000000000003 /* TinyGPUBridgeUserClient.cpp */; };
+		7B1D6E012F2A000000000014 /* TinyGPUBridgeUserClient.iig in Sources */ = {isa = PBXBuildFile; fileRef = 7B1D6E012F2A000000000004 /* TinyGPUBridgeUserClient.iig */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -86,6 +90,10 @@
 		C5C3BBB42612ACEF003C7BFE /* DriverKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = DriverKit.framework; path = Platforms/DriverKit.platform/Developer/SDKs/DriverKit.MacOSX21.0.Internal.sdk/System/DriverKit/System/Library/Frameworks/DriverKit.framework; sourceTree = DEVELOPER_DIR; };
 		C5D787AB261667FC006047E5 /* TinyGPUDriverUserClient.iig */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.iig; path = TinyGPUDriverUserClient.iig; sourceTree = "<group>"; };
 		C5D787AD26168D1E006047E5 /* TinyGPUDriverUserClient.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = TinyGPUDriverUserClient.cpp; sourceTree = "<group>"; };
+		7B1D6E012F2A000000000001 /* TinyGPUBridge.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = TinyGPUBridge.cpp; sourceTree = "<group>"; };
+		7B1D6E012F2A000000000002 /* TinyGPUBridge.iig */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.iig; path = TinyGPUBridge.iig; sourceTree = "<group>"; };
+		7B1D6E012F2A000000000003 /* TinyGPUBridgeUserClient.cpp */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.cpp; path = TinyGPUBridgeUserClient.cpp; sourceTree = "<group>"; };
+		7B1D6E012F2A000000000004 /* TinyGPUBridgeUserClient.iig */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.iig; path = TinyGPUBridgeUserClient.iig; sourceTree = "<group>"; };
 		C5D787B026169723006047E5 /* IOKit.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = IOKit.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX12.0.sdk/System/Library/Frameworks/IOKit.framework; sourceTree = DEVELOPER_DIR; };
 		C5D787B22616973F006047E5 /* SystemExtensions.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = SystemExtensions.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX12.0.sdk/System/Library/Frameworks/SystemExtensions.framework; sourceTree = DEVELOPER_DIR; };
 		C5D787B426169747006047E5 /* Foundation.framework */ = {isa = PBXFileReference; lastKnownFileType = wrapper.framework; name = Foundation.framework; path = Platforms/MacOSX.platform/Developer/SDKs/MacOSX12.0.sdk/System/Library/Frameworks/Foundation.framework; sourceTree = DEVELOPER_DIR; };
@@ -185,6 +193,10 @@
 				C5B7D9C426128AC50089B4C3 /* TinyGPUDriver.iig */,
 				C5D787AD26168D1E006047E5 /* TinyGPUDriverUserClient.cpp */,
 				C5D787AB261667FC006047E5 /* TinyGPUDriverUserClient.iig */,
+				7B1D6E012F2A000000000001 /* TinyGPUBridge.cpp */,
+				7B1D6E012F2A000000000002 /* TinyGPUBridge.iig */,
+				7B1D6E012F2A000000000003 /* TinyGPUBridgeUserClient.cpp */,
+				7B1D6E012F2A000000000004 /* TinyGPUBridgeUserClient.iig */,
 				C5B7D9C626128AC50089B4C3 /* Info.plist */,
 				C5B7D9CE26128B150089B4C3 /* TinyGPUDriver.entitlements */,
 				0AFA851D2F1CE486005FDAC2 /* TinyGPUDriver.Release.entitlements */,
@@ -320,6 +332,10 @@
 				C5B7D9C526128AC50089B4C3 /* TinyGPUDriver.iig in Sources */,
 				C5D787AE26168E59006047E5 /* TinyGPUDriverUserClient.cpp in Sources */,
 				C5D787AC261667FC006047E5 /* TinyGPUDriverUserClient.iig in Sources */,
+				7B1D6E012F2A000000000011 /* TinyGPUBridge.cpp in Sources */,
+				7B1D6E012F2A000000000012 /* TinyGPUBridge.iig in Sources */,
+				7B1D6E012F2A000000000013 /* TinyGPUBridgeUserClient.cpp in Sources */,
+				7B1D6E012F2A000000000014 /* TinyGPUBridgeUserClient.iig in Sources */,
 				C5B7D9C326128AC50089B4C3 /* TinyGPUDriver.cpp in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

@@ -11,6 +11,8 @@
 			<string>0xFFFFFFFF&amp;0x00000000</string>
 		</dict>
 	</array>
+	<key>com.apple.developer.driverkit.transport.pci.bridge</key>
+	<true/>
 	<key>com.apple.developer.driverkit.allow-any-userclient-access</key>
 	<true/>
 </dict>

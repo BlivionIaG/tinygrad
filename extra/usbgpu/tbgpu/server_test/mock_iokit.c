@@ -3,6 +3,13 @@
 // slots reused lowest first, (RELEASE_MAGIC, slot) after the address table, every mapping freed when the connection closes.
 // Environment: MOCK_ARENA_MIB, MOCK_SEG_MIB (split every mapping into segments of that size), MOCK_OLD_DEXT=1 (a dext without ReleaseDMA:
 // no magic, selector 4 unsupported), MOCK_FAIL_RELEASE=N (the Nth ReleaseDMA fails with kIOReturnBusy and leaves the mapping).
+// Link reset: the service plane above the `tinygpu` service is modelled as on the real Mac (display nub, IOPP, nub of the card's switch downstream port,
+// IOPP, switch upstream port, IOPP, ASM2464PD downstream port, IOPP, ASM2464PD upstream port, IOPP, Apple root port nub, ...); the first MOCK_BRIDGES (default 4,
+// at most 4, none with MOCK_OLD_DEXT=1) nubs from the GPU up have a `tinygpubridge` child. Selector 5 of the GPU connection (level 0) and of the connection of the
+// bridge dext at level k appends the line `<level> <type> <options>` to the file MOCK_LOG and returns MOCK_RESET_KR_LEVELk, else MOCK_RESET_KR (default 0);
+// MOCK_OPEN_KR_LEVELk makes IOServiceOpen of that bridge dext fail, MOCK_TERMINATE_NOTIFY=1 delivers kIOMessageServiceIsTerminated from inside a reset that has
+// options & 1. CfgRead (selector 0) at offset 0xF000 / 0xF004 / 0xF008 answers the number of open bridge connections / of unreleased registry objects / of
+// releases and closes that did not match an open one: a test asks after each request that the server holds nothing.
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -43,16 +50,89 @@ static int arena_alloc(uint64_t size, uint64_t *iova) { // lowest free run of `s
 
 static void free_all(void) { memset(slots, 0, sizeof slots); nslots = 0; release_calls = 0; }
 
+// registry model
+enum { N_ENT = 14, FIRST_DEXT = 20, N_HANDLE = 1 << 16, BRIDGE_CONN = 100, GPU_CONN = 1 };
+static const struct { const char *name; int pci, parent; } ents[N_ENT] = {
+  {"tinygpu", 0, 1}, {"display", 1, 2}, {"IOPP", 0, 3}, {"pci-bridge", 1, 4}, {"IOPP", 0, 5}, {"pci-bridge", 1, 6}, {"IOPP", 0, 7},
+  {"pci-bridge", 1, 8}, {"IOPP", 0, 9}, {"pci-bridge", 1, 10}, {"IOPP", 0, 11}, {"pcic2-bridge", 1, 12}, {"pcic2", 0, 13}, {"IOPlatformExpertDevice", 0, -1},
+};
+static const int bridge_nub[5] = {0, 3, 5, 7, 9}; // the nub of level k
+static struct { int ent, live, iterator, pos; } handles[N_HANDLE]; // io_object_t = index + 1000
+static int nhandles, live_handles, bad_closes, open_bridge[5];
+static IOServiceInterestCallback term_cb;
+
+static int n_bridges(void) { return env_u64("MOCK_OLD_DEXT", 0) ? 0 : (int)env_u64("MOCK_BRIDGES", 4) > 4 ? 4 : (int)env_u64("MOCK_BRIDGES", 4); }
+static io_object_t new_handle(int ent, int iterator) {
+  if (nhandles == N_HANDLE) abort();
+  handles[nhandles] = (typeof(handles[0])){.ent = ent, .live = 1, .iterator = iterator};
+  live_handles++;
+  return 1000 + nhandles++;
+}
+static int handle_ent(io_object_t o) { return o >= 1000 && o - 1000 < (io_object_t)nhandles && handles[o - 1000].live ? handles[o - 1000].ent : -1; }
+static int ent_parent(int ent) { // the entity above ent (a dext has its nub), -1 at the top
+  if (ent >= FIRST_DEXT) return bridge_nub[ent - FIRST_DEXT];
+  return ents[ent].parent < 0 || ents[ent].parent >= N_ENT ? -1 : ents[ent].parent;
+}
+static int ent_exists(int ent) { return ent < FIRST_DEXT ? ent >= 0 && ent < N_ENT : ent - FIRST_DEXT >= 1 && ent - FIRST_DEXT <= n_bridges(); }
+
 CFMutableDictionaryRef IOServiceNameMatching(const char *name) { (void)name; return NULL; }
-io_service_t IOServiceGetMatchingService(mach_port_t p, CFDictionaryRef m) { (void)p; (void)m; return 1; }
+io_service_t IOServiceGetMatchingService(mach_port_t p, CFDictionaryRef m) { (void)p; (void)m; return new_handle(0, 0); }
 IONotificationPortRef IONotificationPortCreate(mach_port_t p) { (void)p; return (IONotificationPortRef)1; }
 void IONotificationPortSetDispatchQueue(IONotificationPortRef n, dispatch_queue_t q) { (void)n; (void)q; }
 kern_return_t IOServiceAddInterestNotification(IONotificationPortRef n, io_service_t s, const io_name_t t, IOServiceInterestCallback c, void *r, io_object_t *o) {
-  (void)n; (void)s; (void)t; (void)c; (void)r; *o = 1; return 0;
+  (void)n; (void)s; (void)t; (void)r; term_cb = c; *o = 1; return 0; // handle 1 stands for the notification, which the server keeps for good
 }
-kern_return_t IOObjectRelease(io_object_t o) { (void)o; return 0; }
-kern_return_t IOServiceOpen(io_service_t s, task_port_t t, uint32_t type, io_connect_t *c) { (void)s; (void)t; (void)type; free_all(); *c = 1; return 0; }
-kern_return_t IOServiceClose(io_connect_t c) { (void)c; free_all(); return 0; } // Stop_Impl: CompleteDMA on every command
+kern_return_t IOObjectRelease(io_object_t o) {
+  if (o == 1) return 0;
+  if (handle_ent(o) < 0) { bad_closes++; return KR_BAD_ARG; }
+  handles[o - 1000].live = 0; live_handles--;
+  return 0;
+}
+boolean_t IOObjectConformsTo(io_object_t o, const io_name_t name) { int e = handle_ent(o); return e >= 0 && e < N_ENT && ents[e].pci && !strcmp(name, "IOPCIDevice"); }
+kern_return_t IORegistryEntryGetName(io_registry_entry_t o, io_name_t name) {
+  int e = handle_ent(o);
+  if (e < 0 || handles[o - 1000].iterator) return KR_BAD_ARG;
+  strcpy(name, e >= FIRST_DEXT ? "tinygpubridge" : ents[e].name);
+  return 0;
+}
+kern_return_t IORegistryEntryGetParentEntry(io_registry_entry_t o, const io_name_t plane, io_registry_entry_t *parent) {
+  int e = handle_ent(o);
+  if (e < 0 || handles[o - 1000].iterator || strcmp(plane, kIOServicePlane)) return KR_BAD_ARG;
+  int p = ent_parent(e);
+  if (p < 0) return 0xE00002F0u; // kIOReturnNotFound
+  *parent = new_handle(p, 0);
+  return 0;
+}
+kern_return_t IORegistryEntryGetChildIterator(io_registry_entry_t o, const io_name_t plane, io_iterator_t *it) {
+  int e = handle_ent(o);
+  if (e < 0 || handles[o - 1000].iterator || strcmp(plane, kIOServicePlane)) return KR_BAD_ARG;
+  *it = new_handle(e, 1);
+  return 0;
+}
+static int candidate(int i) { return i < N_ENT ? i : i < N_ENT + 4 ? FIRST_DEXT + 1 + i - N_ENT : -1; }
+io_object_t IOIteratorNext(io_iterator_t it) { // the entities whose parent is the iterated one, in index order (dexts last)
+  int e = handle_ent(it);
+  if (e < 0 || !handles[it - 1000].iterator) return 0;
+  for (int c; (c = candidate(handles[it - 1000].pos++)) >= 0; ) if (ent_exists(c) && ent_parent(c) == e) return new_handle(c, 0);
+  return 0;
+}
+kern_return_t IOServiceOpen(io_service_t s, task_port_t t, uint32_t type, io_connect_t *c) {
+  (void)t; (void)type;
+  int e = s < 1000 ? 0 : handle_ent(s);
+  if (e < 0) return KR_BAD_ARG;
+  if (e < FIRST_DEXT) { free_all(); *c = GPU_CONN; return 0; }
+  char name[32];
+  snprintf(name, sizeof name, "MOCK_OPEN_KR_LEVEL%d", e - FIRST_DEXT);
+  if (env_u64(name, 0)) return (kern_return_t)env_u64(name, 0);
+  open_bridge[e - FIRST_DEXT]++;
+  *c = BRIDGE_CONN + e - FIRST_DEXT;
+  return 0;
+}
+kern_return_t IOServiceClose(io_connect_t c) { // Stop_Impl: CompleteDMA on every command
+  if (c >= BRIDGE_CONN && c < BRIDGE_CONN + 5) { if (open_bridge[c - BRIDGE_CONN]-- <= 0) { open_bridge[c - BRIDGE_CONN] = 0; bad_closes++; } return 0; }
+  free_all();
+  return 0;
+}
 kern_return_t IOConnectMapMemory64(io_connect_t c, uint32_t type, task_port_t t, mach_vm_address_t *a, mach_vm_size_t *s, IOOptionBits o) {
   (void)c; (void)t; (void)o;
   if (type >= 6) return KR_BAD_ARG;
@@ -62,11 +142,32 @@ kern_return_t IOConnectMapMemory64(io_connect_t c, uint32_t type, task_port_t t,
 }
 kern_return_t IOConnectUnmapMemory64(io_connect_t c, uint32_t type, task_port_t t, mach_vm_address_t a) { (void)c; (void)type; (void)t; (void)a; return 0; }
 
+// selector 5 (ResetLink) of the GPU's user client (level 0) or of a bridge dext's (level k)
+static kern_return_t reset_link_call(int level, uint32_t in_cnt, const uint64_t *in) {
+  if (in_cnt != 2) return KR_BAD_ARG;
+  char name[32];
+  snprintf(name, sizeof name, "MOCK_RESET_KR_LEVEL%d", level);
+  kern_return_t kr = (kern_return_t)env_u64(name, env_u64("MOCK_RESET_KR", 0));
+  const char *log = getenv("MOCK_LOG");
+  if (log && *log) { FILE *f = fopen(log, "a"); if (f) { fprintf(f, "%d %llu %llu\n", level, in[0], in[1]); fclose(f); } }
+  if (kr == 0 && (in[1] & 1) && env_u64("MOCK_TERMINATE_NOTIFY", 0) && term_cb) term_cb(NULL, 1, kIOMessageServiceIsTerminated, NULL);
+  return kr;
+}
+
 kern_return_t IOConnectCallMethod(mach_port_t c, uint32_t sel, const uint64_t *in, uint32_t in_cnt, const void *is, size_t isc, uint64_t *out, uint32_t *out_cnt, void *os, size_t *osc) {
-  (void)c; (void)is; (void)isc; (void)os; (void)osc;
+  (void)is; (void)isc; (void)os; (void)osc;
+  if (c >= BRIDGE_CONN && c < BRIDGE_CONN + 5) return sel == 5 ? reset_link_call(c - BRIDGE_CONN, in_cnt, in) : KR_UNSUPPORTED; // a bridge dext knows only ResetLink
   switch (sel) {
-  case 0: if (in_cnt != 2 || *out_cnt < 1) return KR_BAD_ARG; out[0] = in[0] == 0 ? 0x1002 : 0; *out_cnt = 1; return 0; // CfgRead: vendor id
+  case 0: { // CfgRead: vendor id, or the debug window
+    if (in_cnt != 2 || *out_cnt < 1) return KR_BAD_ARG;
+    int open = 0;
+    for (int i = 1; i < 5; i++) open += open_bridge[i];
+    out[0] = in[0] == 0 ? 0x1002 : in[0] == 0xF000 ? (uint64_t)open : in[0] == 0xF004 ? (uint64_t)live_handles : in[0] == 0xF008 ? (uint64_t)bad_closes : 0;
+    *out_cnt = 1;
+    return 0;
+  }
   case 1: case 2: return 0; // CfgWrite, Reset
+  case 5: return env_u64("MOCK_OLD_DEXT", 0) ? KR_UNSUPPORTED : reset_link_call(0, in_cnt, in); // a dext without ResetLink
   case 4: { // ReleaseDMA
     if (env_u64("MOCK_OLD_DEXT", 0)) return KR_UNSUPPORTED;
     if (in_cnt != 1 || in[0] >= (uint64_t)nslots || !slots[in[0]].live) return KR_BAD_ARG;
