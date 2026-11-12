@@ -47,6 +47,9 @@ struct TinyGPUDriverUserClient_IVars
 // PrepareDMA appends these two words after the (0, 0) that ends its address table: a server that sees the magic knows ReleaseDMA exists and which slot to name
 static const uint64_t kReleaseDMAMagic = 0x52454C444D410001ull;
 
+// IOConnectMapMemory64 type of a write-combined BAR: kBarTypeWC | bar
+static const uint64_t kBarTypeWC = 0xF0000100ull;
+
 bool TinyGPUDriverUserClient::init()
 {
 	auto ok = super::init();
@@ -192,6 +195,12 @@ kern_return_t TinyGPUDriverUserClient::ExternalMethod(uint64_t selector, IOUserC
 		// scalar in = [type, options] of IOPCIDevice::Reset on the GPU's nub (everything below its parent bridge is reset); the kern_return of Reset comes back unchanged
 		if (args->scalarInputCount != 2) return kIOReturnBadArgument;
 		return ivars->provider->ResetLink(uint32_t(args->scalarInput[0]), uint32_t(args->scalarInput[1]));
+	} else if (selector == TinyGPURPC::Features) {
+		// scalar out[0] = feature bits of this dext: bit 0 = a BAR can be mapped write-combined (user-client memory type kBarTypeWC | bar)
+		if (args->scalarOutputCount < 1) return kIOReturnBadArgument;
+		args->scalarOutput[0] = 1;
+		args->scalarOutputCount = 1;
+		return kIOReturnSuccess;
 	}
 
 	return kIOReturnUnsupported;
@@ -202,10 +211,15 @@ kern_return_t IMPL(TinyGPUDriverUserClient, CopyClientMemoryForType)
 	if (!memory) return kIOReturnBadArgument;
 	if (!ivars->provider.get()) return kIOReturnNotAttached;
 
-	// bar handling, type is bar num
+	// bar handling, type is bar num; the same BAR write-combined is kBarTypeWC | bar (above every DMA size, which the DART caps at 2047 MiB)
 	if (type < 6) {
 		uint32_t bar = (uint32_t)type;
-		return ivars->provider->MapBar(bar, memory);
+		return ivars->provider->MapBar(bar, false, memory);
+	}
+	if ((type & ~0xFFull) == kBarTypeWC) {
+		uint32_t bar = (uint32_t)(type & 0xFF);
+		if (bar >= 6) return kIOReturnBadArgument;
+		return ivars->provider->MapBar(bar, true, memory);
 	}
 
 	// dma handling, type is size

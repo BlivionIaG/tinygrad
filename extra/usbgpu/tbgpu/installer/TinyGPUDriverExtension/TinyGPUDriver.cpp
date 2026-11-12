@@ -92,13 +92,14 @@ error:
 	return err;
 }
 
-kern_return_t TinyGPUDriver::MapBar(uint32_t bar, IOMemoryDescriptor** memory)
+kern_return_t TinyGPUDriver::MapBar(uint32_t bar, bool writeCombined, IOMemoryDescriptor** memory)
 {
 	uint8_t barMemoryIndex, barMemoryType;
 	uint64_t barMemorySize;
 	kern_return_t err = ivars->pci->GetBARInfo(bar, &barMemoryIndex, &barMemorySize, &barMemoryType);
 	if (err) return err;
-	os_log(OS_LOG_DEFAULT, "tinygpu: bar mapping %d idx=%d", bar, barMemoryIndex);
+	os_log(OS_LOG_DEFAULT, "tinygpu: bar mapping %d idx=%d wc=%d", bar, barMemoryIndex, writeCombined);
+	if (writeCombined) return ivars->pci->_CopyWCDeviceMemoryWithIndex(barMemoryIndex, memory, this);
 	return ivars->pci->_CopyDeviceMemoryWithIndex(barMemoryIndex, memory, this);
 }
 

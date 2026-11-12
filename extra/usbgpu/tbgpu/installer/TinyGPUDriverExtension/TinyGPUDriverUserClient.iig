@@ -11,6 +11,7 @@ enum TinyGPURPC
 	PrepareDMA,
 	ReleaseDMA,
 	ResetLink,
+	Features,
 };
 
 class TinyGPUDriverUserClient : public IOUserClient

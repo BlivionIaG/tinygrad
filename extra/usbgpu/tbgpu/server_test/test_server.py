@@ -13,15 +13,19 @@ MAP_BAR, MAP_SYSMEM_FD, CFG_READ, MMIO_READ, MMIO_WRITE, UNMAP_SYSMEM, MAP_FD, R
 KR_NO_MEMORY, KR_NO_DEVICE, KR_BAD_ARG, KR_UNSUPPORTED, KR_BUSY = 0xE00002BD, 0xE00002C0, 0xE00002C2, 0xE00002C7, 0xE00002D5
 HOT_RESET, WARM_RESET, FUNCTION_RESET, TERMINATE = 1, 2, 0x10, 1
 MAGIC, PAGE, MIB = 0x52454C444D410001, 16384, 1 << 20
+FEATURES = 18
+FEAT_FEATURES, FEAT_READ_1SEND, FEAT_WC_BAR0, FEAT_QOS_SPIN, PROTO_VERSION = 1, 2, 4, 8, 1
 
 def build(dst:str):
-  srcs = [SERVER_C, os.path.join(HERE, "mock_iokit.c"), os.path.join(HERE, "mock_main.c")]
+  srcs = [os.path.join(HERE, "mock_iokit.c"), os.path.join(HERE, "mock_main.c")]
   clt = "/Library/Developer/CommandLineTools"
   sdks = sorted(glob.glob(f"{clt}/SDKs/MacOSX*.sdk"))
   tries = [["xcrun", "clang"]]
   if sdks: tries.append([f"{clt}/usr/bin/clang", "-isysroot", sdks[-1]]) # works while the Xcode license is not accepted
+  def run(cc, args) -> bool: return subprocess.run([*cc, "-O1", *args], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
   for cc in tries:
-    if subprocess.run([*cc, "-O1", "-o", dst, *srcs], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0: return
+    obj = dst + ".server.o"  # server.c alone is built with mock_sys.h: it counts the sends the server makes
+    if run(cc, ["-c", "-include", os.path.join(HERE, "mock_sys.h"), "-o", obj, SERVER_C]) and run(cc, ["-o", dst, obj, *srcs]): return
   raise RuntimeError("cannot build server.c with the mock IOKit")
 
 class Client:
@@ -418,5 +422,70 @@ try: d.free_sysmem(a); raise SystemExit("refusal not reported")
 except RuntimeError as e: assert "refused" in str(e)
 assert a.addr in d.blocks and d.can_release and d.free_sysmem(a)
 """, MOCK_FAIL_RELEASE="1")
+
+
+class TestFeatures(ServerCase):
+  def mmio(self, c:Client, bar:int, off:int, n:int) -> bytes:
+    c.s.sendall(struct.pack(REQ, MMIO_READ, 0, bar, off, n, 0))
+    st, r0, _ = struct.unpack(RESP, c.recvall(struct.calcsize(RESP)))
+    self.assertEqual((st, r0), (0, n))
+    return c.recvall(n)
+
+  def write(self, c:Client, bar:int, off:int, data:bytes):
+    c.s.sendall(struct.pack(REQ, MMIO_WRITE, 0, bar, off, len(data), 0) + data)
+
+  def test_features_answer(self):
+    st, reg, f = self.start().rpc(FEATURES, PROTO_VERSION)
+    self.assertEqual((st, reg, f >> 32), (0, 0x100000a5c, 1))
+    self.assertEqual(f & 0xFFFFFFFF, FEAT_FEATURES | FEAT_READ_1SEND | FEAT_WC_BAR0 | FEAT_QOS_SPIN)
+
+  def test_features_registry_id_unknown(self):
+    self.assertEqual(self.start(MOCK_REG_ID="0").rpc(FEATURES, PROTO_VERSION)[1], 0)
+
+  def test_features_without_wc_in_the_dext(self):
+    for env in ({"MOCK_NO_WC": "1"}, {"MOCK_OLD_DEXT": "1"}):  # a dext that does not know selector 6
+      st, _, f = self.start(**env).rpc(FEATURES, PROTO_VERSION)
+      self.assertEqual((st, f & 0xFFFFFFFF), (0, FEAT_FEATURES | FEAT_READ_1SEND | FEAT_QOS_SPIN))
+
+  def test_old_server_answer_means_no_features(self):  # what the client sees from a server that predates 18 (and what a command it does not know gets)
+    self.assertEqual(self.start().rpc(99), (1, 0, 0))
+
+  def test_features_do_not_disturb_the_stream(self):
+    c = self.start()
+    c.rpc(FEATURES, PROTO_VERSION)
+    self.assertEqual(c.rpc(MAP_BAR, bar=0)[0], 0)
+    self.write(c, 0, 0x40, b"\x01\x02\x03\x04")
+    self.assertEqual(self.mmio(c, 0, 0x40, 4), b"\x01\x02\x03\x04")
+
+  def test_read_answer_is_one_send(self):
+    c = self.start()
+    c.rpc(MAP_BAR, bar=2)
+    self.write(c, 2, 0, bytes(range(256)))
+    before = c.rpc(CFG_READ, 0xF00C, 4)[1]
+    self.assertEqual(self.mmio(c, 2, 0, 256), bytes(range(256)))
+    after = c.rpc(CFG_READ, 0xF00C, 4)[1]
+    self.assertEqual(after - before, 2)  # the read's answer and the answer of the first CFG_READ: the header and the data went in one sendmsg
+
+  def test_big_read_survives_partial_sends(self):
+    c = self.start()
+    c.rpc(MAP_BAR, bar=0)
+    pattern = bytes((i * 7) & 0xFF for i in range(1 << 20))
+    self.write(c, 0, 0, pattern)
+    for _ in range(4): self.assertEqual(self.mmio(c, 0, 0, 1 << 20), pattern)
+
+  def test_qos_user_interactive(self):
+    self.assertEqual(self.start().rpc(CFG_READ, 0xF010, 4)[1], 0x21)  # QOS_CLASS_USER_INTERACTIVE
+
+  def test_spin_keeps_the_stream_and_eof_working(self):
+    c = self.start(TINYGPU_SPIN_US="200000")
+    c.rpc(MAP_BAR, bar=0)
+    for i in range(200):
+      self.write(c, 0, 4 * i, struct.pack('<I', i))
+      self.assertEqual(struct.unpack('<I', self.mmio(c, 0, 4 * i, 4))[0], i)
+    c.close()  # EOF while the server spins
+    c2 = Client(self.path)
+    self.addCleanup(c2.close)
+    self.assertEqual(c2.rpc(MAP_BAR, bar=0)[0], 0)
+    self.assertEqual(c2.rpc(CFG_READ, 0, 2)[1], 0x1002)
 
 if __name__ == "__main__": unittest.main()

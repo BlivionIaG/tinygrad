@@ -9,7 +9,9 @@
 // bridge dext at level k appends the line `<level> <type> <options>` to the file MOCK_LOG and returns MOCK_RESET_KR_LEVELk, else MOCK_RESET_KR (default 0);
 // MOCK_OPEN_KR_LEVELk makes IOServiceOpen of that bridge dext fail, MOCK_TERMINATE_NOTIFY=1 delivers kIOMessageServiceIsTerminated from inside a reset that has
 // options & 1. CfgRead (selector 0) at offset 0xF000 / 0xF004 / 0xF008 answers the number of open bridge connections / of unreleased registry objects / of
-// releases and closes that did not match an open one: a test asks after each request that the server holds nothing.
+// releases and closes that did not match an open one: a test asks after each request that the server holds nothing. 0xF00C: sendmsg + send calls the server made so far,
+// 0xF010: the QoS class of the serving thread. MOCK_REG_ID: the registry entry id of the service (default 0x100000a5c). Selector 6 (Features, WC BARs) is
+// unsupported with MOCK_OLD_DEXT=1 or MOCK_NO_WC=1. A BAR type 0xF0000100 | bar maps the same memory as the plain one.
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -17,6 +19,8 @@
 #include <mach/mach.h>
 #include <IOKit/IOKitLib.h>
 #include <IOKit/IOMessage.h>
+#include <sys/socket.h>
+#include <pthread/qos.h>
 
 #define KR_NO_MEMORY 0xE00002BDu
 #define KR_BAD_ARG 0xE00002C2u
@@ -89,6 +93,12 @@ kern_return_t IOObjectRelease(io_object_t o) {
   return 0;
 }
 boolean_t IOObjectConformsTo(io_object_t o, const io_name_t name) { int e = handle_ent(o); return e >= 0 && e < N_ENT && ents[e].pci && !strcmp(name, "IOPCIDevice"); }
+kern_return_t IORegistryEntryGetRegistryEntryID(io_registry_entry_t o, uint64_t *id) { (void)o; *id = env_u64("MOCK_REG_ID", 0x100000a5cull); return 0; }
+
+unsigned long mock_sends; // sendmsg + send calls of server.c (mock_sys.h)
+ssize_t mock_sendmsg(int fd, const struct msghdr *msg, int flags) { mock_sends++; return (sendmsg)(fd, msg, flags); }
+ssize_t mock_send(int fd, const void *buf, size_t len, int flags) { mock_sends++; return (send)(fd, buf, len, flags); }
+
 kern_return_t IORegistryEntryGetName(io_registry_entry_t o, io_name_t name) {
   int e = handle_ent(o);
   if (e < 0 || handles[o - 1000].iterator) return KR_BAD_ARG;
@@ -135,6 +145,7 @@ kern_return_t IOServiceClose(io_connect_t c) { // Stop_Impl: CompleteDMA on ever
 }
 kern_return_t IOConnectMapMemory64(io_connect_t c, uint32_t type, task_port_t t, mach_vm_address_t *a, mach_vm_size_t *s, IOOptionBits o) {
   (void)c; (void)t; (void)o;
+  if (type >= 6 && (type & ~0xFFu) == 0xF0000100u) type &= 0xFF; // a write-combined BAR: the same memory in the mock
   if (type >= 6) return KR_BAD_ARG;
   if (!bar_mem[type]) bar_mem[type] = calloc(1, 1 << 20);
   *a = (mach_vm_address_t)bar_mem[type]; *s = 1 << 20;
@@ -162,10 +173,16 @@ kern_return_t IOConnectCallMethod(mach_port_t c, uint32_t sel, const uint64_t *i
     if (in_cnt != 2 || *out_cnt < 1) return KR_BAD_ARG;
     int open = 0;
     for (int i = 1; i < 5; i++) open += open_bridge[i];
-    out[0] = in[0] == 0 ? 0x1002 : in[0] == 0xF000 ? (uint64_t)open : in[0] == 0xF004 ? (uint64_t)live_handles : in[0] == 0xF008 ? (uint64_t)bad_closes : 0;
+    out[0] = in[0] == 0 ? 0x1002 : in[0] == 0xF000 ? (uint64_t)open : in[0] == 0xF004 ? (uint64_t)live_handles : in[0] == 0xF008 ? (uint64_t)bad_closes
+           : in[0] == 0xF00C ? mock_sends : in[0] == 0xF010 ? (uint64_t)qos_class_self() : 0;
     *out_cnt = 1;
     return 0;
   }
+  case 6: // Features: bit 0 = write-combined BARs
+    if (*out_cnt < 1) return KR_BAD_ARG;
+    if (env_u64("MOCK_OLD_DEXT", 0) || env_u64("MOCK_NO_WC", 0)) return KR_UNSUPPORTED;
+    out[0] = 1; *out_cnt = 1;
+    return 0;
   case 1: case 2: return 0; // CfgWrite, Reset
   case 5: return env_u64("MOCK_OLD_DEXT", 0) ? KR_UNSUPPORTED : reset_link_call(0, in_cnt, in); // a dext without ResetLink
   case 4: { // ReleaseDMA

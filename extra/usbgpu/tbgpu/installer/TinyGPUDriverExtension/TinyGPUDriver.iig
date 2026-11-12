@@ -26,7 +26,7 @@ public:
 
 	virtual kern_return_t NewUserClient(uint32_t in_type, IOUserClient** out_user_client) override;
 
-	kern_return_t MapBar(uint32_t bar, IOMemoryDescriptor** memory) LOCALONLY;
+	kern_return_t MapBar(uint32_t bar, bool writeCombined, IOMemoryDescriptor** memory) LOCALONLY;
 	kern_return_t CreateDMA(size_t size, TinyGPUCreateDMAResp* dmaDesc) LOCALONLY;
 	kern_return_t SetupDMA(IOMemoryDescriptor* memory, uint64_t size, IODMACommand** outCmd,
 	                       IOAddressSegment* segments, uint32_t* segCount) LOCALONLY;

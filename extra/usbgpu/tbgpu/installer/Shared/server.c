@@ -13,6 +13,10 @@
 #include <IOKit/IOKitLib.h>
 #include <IOKit/IOMessage.h>
 #include <mach/mach.h>
+#include <pthread.h>
+#include <poll.h>
+#include <sys/stat.h>
+#include <time.h>
 
 // Protocol
 
@@ -32,8 +36,25 @@ enum {
   CMD_UNMAP_SYSMEM = 15,  // give a DMA block back: arg0 = block index (resp1 of the call that made it)
   CMD_MAP_FD = 16,        // DMA map a range of client memory: fd via SCM_RIGHTS, arg0 = offset, arg1 = size (multiples of 16 KiB)
   CMD_RESET_LINK = 17,    // reset the PCIe link: arg0 = level, arg1 = type (0: query), arg2 = options
+  CMD_FEATURES = 18,      // what this server can do (see below): arg0 = the client's protocol version
   RESP_OK = 0, RESP_ERR = 1,
+  FEAT_FEATURES = 1u << 0,   // CMD_FEATURES itself
+  FEAT_READ_1SEND = 1u << 1, // an MMIO_READ answer (header + data) leaves in one sendmsg
+  FEAT_WC_BAR0 = 1u << 2,    // the dext maps a BAR write-combined for the user-client memory type WC_BAR_TYPE | bar
+  FEAT_QOS_SPIN = 1u << 3,   // the serving thread runs at QOS_CLASS_USER_INTERACTIVE and honours TINYGPU_SPIN_US
+  PROTO_VERSION = 1,
+  WC_BAR_TYPE = 0xF0000100u, // IOConnectMapMemory64 type of a write-combined BAR: WC_BAR_TYPE | bar (plain types stay `bar`; DMA types are sizes < 2047 MiB)
 };
+
+// Features and the fast path (additive: an old server answers (1, 0, 0) to 18, a new one sets resp1 != 0). The client sends its protocol version in arg0.
+//   FEATURES: status 0, resp0 = the IORegistryEntryID of the `tinygpu` service (0 = unknown; a second process can find the very service with
+//     IORegistryEntryIDMatching), resp1 = version << 32 | feature bits. An old server's answer has resp1 = 0: no features, find the service by name.
+//   FEAT_READ_1SEND: the answer to MMIO_READ is the same byte stream as always (a 17-byte response, then the data) but leaves in one sendmsg: one send and
+//     one wake-up less on each side. Needs nothing from the client.
+//   FEAT_WC_BAR0: the dext answered selector 6 (Features) with bit 0: a user client of the dext can map BAR b write-combined with IOConnectMapMemory64
+//     type WC_BAR_TYPE | b (bulk BAR0 stores; BAR2 doorbells and BAR5 registers keep the plain type). Only a process that may open the dext itself can use it.
+//   FEAT_QOS_SPIN: the serving thread runs at QOS_CLASS_USER_INTERACTIVE. TINYGPU_SPIN_US=n (default 0) makes the server poll its socket for n microseconds
+//     after each answer before it blocks, which saves the wake-up of a dense request stream (a request after a longer pause still finds it asleep).
 
 typedef struct { uint8_t cmd; uint32_t dev_id, bar; uint64_t arg0, arg1, arg2; } __attribute__((packed)) request_t;
 typedef struct { uint8_t status; uint64_t resp0, resp1; } __attribute__((packed)) response_t;
@@ -77,6 +98,8 @@ typedef struct { uint8_t status; uint64_t resp0, resp1; } __attribute__((packed)
 static uint8_t g_bulk_buf[BULK_BUF_SIZE];
 static io_connect_t g_conn = IO_OBJECT_NULL;
 static int g_client_active = 0;
+static uint64_t g_reg_id;       // IORegistryEntryID of the tinygpu service (0 = unknown)
+static uint64_t g_spin_ns;      // TINYGPU_SPIN_US in ns
 static volatile int g_terminating = 0, g_exit_pending = 0; // a link reset with the terminate option is in flight / the dext went away meanwhile
 
 static struct { mach_vm_address_t addr; mach_vm_size_t size; } g_bars[MAX_BARS];
@@ -138,6 +161,41 @@ static void send_error(int fd, const char *msg) {
   send(fd, msg, strlen(msg), 0);
 }
 
+// the answer of one request and its data in ONE sendmsg (the byte stream is the one a send_response followed by a send makes)
+static int send_response_data(int fd, response_t *resp, const void *data, size_t len) {
+  struct iovec iov[2] = {{resp, sizeof(*resp)}, {(void*)data, len}};
+  struct msghdr msg = {.msg_iov = iov, .msg_iovlen = 2};
+  size_t left = sizeof(*resp) + len;
+  while (left) {
+    ssize_t r = sendmsg(fd, &msg, 0);
+    if (r < 0 && errno == EINTR) continue;
+    if (r <= 0) return -1;
+    left -= r;
+    if (!left) break;
+    size_t skip = r; // a partial send: step over what went out
+    struct iovec *v = msg.msg_iov;
+    while (skip >= v->iov_len) { skip -= v->iov_len; v++; msg.msg_iovlen--; }
+    v->iov_base = (uint8_t*)v->iov_base + skip;
+    v->iov_len -= skip;
+    msg.msg_iov = v;
+  }
+  return 0;
+}
+
+static uint64_t now_ns(void) { return clock_gettime_nsec_np(CLOCK_UPTIME_RAW); }
+
+// TINYGPU_SPIN_US: after an answer, poll the socket for this long before blocking in recvmsg (a request that arrives meanwhile is picked up without a wake-up)
+static void spin_for_request(int fd) {
+  if (!g_spin_ns) return;
+  uint64_t since = now_ns();
+  for (unsigned i = 0;; i++) {
+    char b;
+    ssize_t r = recv(fd, &b, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (r >= 0 || (errno != EAGAIN && errno != EINTR)) return; // data, EOF or an error: recv_request deals with it
+    if ((i & 15) == 15 && now_ns() - since > g_spin_ns) return;
+  }
+}
+
 // Driver interface
 
 static void on_disconnect(void *refcon, io_service_t svc, uint32_t msg, void *arg) {
@@ -159,6 +217,8 @@ static io_connect_t open_tinygpu(void) {
 
   io_connect_t conn;
   kern_return_t kr = IOServiceOpen(svc, mach_task_self(), 0, &conn);
+  uint64_t id = 0;
+  g_reg_id = IORegistryEntryGetRegistryEntryID(svc, &id) == KERN_SUCCESS ? id : 0;
   IOObjectRelease(svc);
   return kr == KERN_SUCCESS ? conn : IO_OBJECT_NULL;
 }
@@ -169,6 +229,12 @@ static int dext_rpc(uint32_t sel, uint64_t *in, uint32_t in_cnt, uint64_t *out_v
   if (IOConnectCallMethod(g_conn, sel, in, in_cnt, NULL, 0, out, &out_cnt, NULL, NULL) != KERN_SUCCESS) return -1;
   if (out_val) *out_val = out[0];
   return 0;
+}
+
+// selector 6 of the dext's user client (Features): bit 0 = it maps a BAR write-combined for the type WC_BAR_TYPE | bar. A dext without it answers kIOReturnUnsupported.
+static int dext_has_wc(void) {
+  uint64_t v = 0;
+  return dext_rpc(6, NULL, 0, &v) == 0 && (v & 1);
 }
 
 static uint32_t dext_call(uint32_t sel, uint64_t *in, uint32_t in_cnt) {
@@ -372,7 +438,7 @@ static void handle_client(int fd) {
   request_t req;
   response_t resp;
   int req_fd;
-  while (recv_request(fd, &req, &req_fd) == 0) {
+  while ((spin_for_request(fd), recv_request(fd, &req, &req_fd)) == 0) {
     resp = (response_t){0};
     if (req_fd >= 0 && req.cmd != CMD_MAP_FD) { close(req_fd); req_fd = -1; }
 
@@ -432,9 +498,13 @@ static void handle_client(int fd) {
       if (validate_bar(req.bar, req.arg0, req.arg1)) { resp.status = 1; break; }
       mmio_copy(g_bulk_buf, (void*)(g_bars[req.bar].addr + req.arg0), req.arg1);
       resp.resp0 = req.arg1;
-      send_response(fd, &resp, -1);
-      send(fd, g_bulk_buf, req.arg1, 0);
+      send_response_data(fd, &resp, g_bulk_buf, req.arg1);
       continue;
+
+    case CMD_FEATURES:
+      resp.resp0 = g_reg_id;
+      resp.resp1 = (uint64_t)PROTO_VERSION << 32 | FEAT_FEATURES | FEAT_READ_1SEND | FEAT_QOS_SPIN | (dext_has_wc() ? FEAT_WC_BAR0 : 0);
+      break;
 
     case CMD_MMIO_WRITE:
       recvall(fd, g_bulk_buf, req.arg1);
@@ -463,6 +533,10 @@ int run_server(const char *sock_path) {
   if (bind(server_fd, (struct sockaddr*)&addr, sizeof(addr)) < 0) { perror("bind"); close(server_fd); return 1; }
   if (listen(server_fd, 1) < 0) { perror("listen"); close(server_fd); return 1; }
   printf("listening on %s\n", sock_path);
+  pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0); // the thread that serves the client: a request is latency, not throughput
+  const char *spin = getenv("TINYGPU_SPIN_US");
+  g_spin_ns = spin && *spin ? strtoull(spin, NULL, 0) * 1000ull : 0;
+  if (g_spin_ns) printf("spinning %llu us after each answer\n", (unsigned long long)(g_spin_ns / 1000));
 
   while (1) {
     int client_fd = accept(server_fd, NULL, NULL);
