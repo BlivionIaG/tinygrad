@@ -1,15 +1,17 @@
 #!/usr/bin/env python3
 # Runs the REAL extra/usbgpu/tbgpu/installer/Shared/server.c (built against mock_iokit.c, no dext, no GPU, macOS only) and speaks the wire
 # protocol to it: MAP_SYSMEM_FD / UNMAP_SYSMEM / MAP_FD, the 128 live block limit, a dext without ReleaseDMA, a refused release, the DMA arena
-# cap, cleanup on disconnect, and extra/hcq1/remote.py's APLRemotePCIDevice against it.
+# cap, cleanup on disconnect, RESET_LINK (the GPU's nub, failures, an old dext), and
+# extra/hcq1/remote.py's APLRemotePCIDevice against it.
 #   python3 extra/usbgpu/tbgpu/server_test/test_server.py
 import _posixshmem, array, glob, mmap, os, shutil, socket, struct, subprocess, sys, tempfile, time, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SERVER_C = os.path.join(HERE, "..", "installer", "Shared", "server.c")
 REQ, RESP = '<BIIQQQ', '<BQQ'
-MAP_BAR, MAP_SYSMEM_FD, CFG_READ, MMIO_READ, MMIO_WRITE, UNMAP_SYSMEM, MAP_FD = 1, 2, 3, 6, 7, 15, 16
-KR_NO_MEMORY, KR_BAD_ARG, KR_UNSUPPORTED, KR_BUSY = 0xE00002BD, 0xE00002C2, 0xE00002C7, 0xE00002D5
+MAP_BAR, MAP_SYSMEM_FD, CFG_READ, MMIO_READ, MMIO_WRITE, UNMAP_SYSMEM, MAP_FD, RESET_LINK = 1, 2, 3, 6, 7, 15, 16, 17
+KR_NO_MEMORY, KR_NO_DEVICE, KR_BAD_ARG, KR_UNSUPPORTED, KR_BUSY = 0xE00002BD, 0xE00002C0, 0xE00002C2, 0xE00002C7, 0xE00002D5
+HOT_RESET, WARM_RESET, FUNCTION_RESET, TERMINATE = 1, 2, 0x10, 1
 MAGIC, PAGE, MIB = 0x52454C444D410001, 16384, 1 << 20
 
 def build(dst:str):
@@ -90,8 +92,8 @@ class ServerCase(unittest.TestCase):
 
   def start(self, **env:str) -> Client:
     self.path = os.path.join(self.tmp, f"s{time.monotonic_ns()}.sock")
-    self.proc = subprocess.Popen([self.binary, self.path], env=dict(os.environ, **env), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    self.addCleanup(lambda: (self.proc.kill(), self.proc.wait()))
+    p = self.proc = subprocess.Popen([self.binary, self.path], env=dict(os.environ, **env), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    self.addCleanup(lambda: (p.kill(), p.wait()))  # one per server: a test may start several
     self.c = Client(self.path)
     self.addCleanup(self.c.close)
     return self.c
@@ -224,6 +226,79 @@ class TestMapFd(ServerCase):
       st, _, idx, pairs = c.map_fd(fd, 0, 64 * MIB)
       self.assertEqual(st, 0)
       self.assertEqual(c.rpc(UNMAP_SYSMEM, idx)[:2], (0, 64 * MIB))
+
+class TestResetLink(ServerCase):
+  def start(self, **env:str) -> Client:
+    self.log = os.path.join(self.tmp, f"log{time.monotonic_ns()}")
+    return super().start(MOCK_LOG=self.log, **env)
+
+  def calls(self) -> list[tuple[int, int, int]]: # (level, type, options) of every selector 5 the mock saw
+    if not os.path.exists(self.log): return []
+    with open(self.log) as f: return [tuple(map(int, l.split())) for l in f]  # type: ignore[misc]
+
+  def test_query(self):
+    c = self.start()
+    self.assertEqual(c.rpc(RESET_LINK, 0, 0, 0), (0, 0, 1))  # no level above the GPU
+    self.assertEqual(c.rpc(RESET_LINK, 3, 0, 1), (0, 0, 1))  # level and options mean nothing to a query
+    self.assertEqual(self.calls(), [])  # nothing was reset
+    self.assertEqual(c.rpc(CFG_READ, 0, 2)[:2], (0, 0x1002))
+
+  def test_level0(self):
+    c = self.start()
+    for typ in (HOT_RESET, WARM_RESET, FUNCTION_RESET): self.assertEqual(c.rpc(RESET_LINK, 0, typ, 0), (0, 0, 1))
+    self.assertEqual(self.calls(), [(0, HOT_RESET, 0), (0, WARM_RESET, 0), (0, FUNCTION_RESET, 0)])
+    self.assertEqual(c.rpc(CFG_READ, 0, 2)[:2], (0, 0x1002))
+
+  def test_levels_above_the_gpu_are_not_there(self):
+    c = self.start()
+    for k in (1, 4, 32, 33, 1 << 32, 1 << 40): self.assertEqual(c.rpc(RESET_LINK, k, HOT_RESET, 0), (1, KR_NO_DEVICE, 1))
+    self.assertEqual(self.calls(), [])
+
+  def test_failures(self):
+    c = self.start(MOCK_RESET_KR=hex(KR_BUSY))
+    self.assertEqual(c.rpc(RESET_LINK, 0, HOT_RESET, 0), (1, KR_BUSY, 1))  # what Reset returned, unchanged
+    self.assertEqual(self.calls(), [(0, 1, 0)])
+    c.close()
+    c = self.start()
+    for typ, opt in ((1 << 32, 0), (1, 1 << 32), (1 << 63, 1 << 63)): self.assertEqual(c.rpc(RESET_LINK, 0, typ, opt), (1, KR_BAD_ARG, 1))  # the dext takes 32 bits
+    self.assertEqual(self.calls(), [])
+
+  def test_terminate_option_is_passed_through(self):
+    c = self.start()
+    self.assertEqual(c.rpc(RESET_LINK, 0, HOT_RESET, TERMINATE), (0, 0, 1))
+    self.assertEqual(c.rpc(RESET_LINK, 0, WARM_RESET, 0xA5), (0, 0, 1))
+    self.assertEqual(self.calls(), [(0, 1, 1), (0, 2, 0xA5)])
+    self.assertEqual(c.rpc(CFG_READ, 0, 2)[:2], (0, 0x1002))  # the mock does not terminate anything here: the server keeps serving
+
+  def test_terminate_notification_during_the_reset_exits_after_the_answer(self):
+    c = self.start(MOCK_TERMINATE_NOTIFY="1")  # the dext terminates while Reset runs: the server answers first, then exits
+    self.assertEqual(c.rpc(RESET_LINK, 0, HOT_RESET, TERMINATE), (0, 0, 1))
+    self.assertEqual(c.s.recv(1), b"")  # the connection closes
+    self.assertEqual(self.proc.wait(10), 0)
+    self.assertEqual(self.calls(), [(0, 1, 1)])
+    c.close()
+    c = self.start(MOCK_TERMINATE_NOTIFY="1")  # no terminate option, no termination: still alive
+    self.assertEqual(c.rpc(RESET_LINK, 0, HOT_RESET, 0), (0, 0, 1))
+    self.assertEqual(c.rpc(CFG_READ, 0, 2)[:2], (0, 0x1002))
+
+  def test_old_dext(self):
+    c = self.start(MOCK_OLD_DEXT="1")  # a GPU dext without ResetLink
+    self.assertEqual(c.rpc(RESET_LINK), (0, 0, 1))
+    self.assertEqual(c.rpc(RESET_LINK, 0, HOT_RESET, 0), (1, KR_UNSUPPORTED, 1))
+    self.assertEqual(self.calls(), [])
+
+  def test_after_other_traffic(self):
+    c = self.start()
+    st, idx, mm, _ = c.map_sysmem(2 * MIB)
+    self.assertEqual((st, idx), (0, 0))
+    self.assertEqual(c.rpc(MAP_BAR, bar=0)[0], 0)
+    self.assertEqual(c.rpc(RESET_LINK, 0, HOT_RESET, 0), (0, 0, 1))
+    self.assertEqual(c.rpc(UNMAP_SYSMEM, idx), (0, 2 * MIB, 1))  # the DMA state is untouched by a reset request
+    self.assertEqual(c.map_sysmem(MIB)[:2], (0, 0))
+    self.assertEqual(c.rpc(RESET_LINK), (0, 0, 1))
+    c.close()
+    c = self.start()  # a new client after the old one left
+    self.assertEqual(c.rpc(RESET_LINK, 0, HOT_RESET, 0), (0, 0, 1))
 
 PRELUDE = """
 import _posixshmem, os

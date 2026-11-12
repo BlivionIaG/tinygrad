@@ -31,6 +31,7 @@ enum {
   CMD_RESIZE_BAR = 11,    // resize bar (noop)
   CMD_UNMAP_SYSMEM = 15,  // give a DMA block back: arg0 = block index (resp1 of the call that made it)
   CMD_MAP_FD = 16,        // DMA map a range of client memory: fd via SCM_RIGHTS, arg0 = offset, arg1 = size (multiples of 16 KiB)
+  CMD_RESET_LINK = 17,    // reset the PCIe link: arg0 = level, arg1 = type (0: query), arg2 = options
   RESP_OK = 0, RESP_ERR = 1,
 };
 
@@ -47,6 +48,16 @@ typedef struct { uint8_t status; uint64_t resp0, resp1; } __attribute__((packed)
 // cannot check: the client must first idle every engine that can reach the block and remove its own device mappings (GPU PTEs and TLB flush).
 // The total live DMA is still capped by the aperture of the Thunderbolt PCIe controller's DART (about 2047 MiB): this time-multiplexes it.
 
+// Link reset (additive: an old server answers (1, 0, 0) to 17, a new one always sets resp1 = 1). A dead Thunderbolt / PCIe link can be reset without a replug.
+// IOPCIDevice::Reset(type, options) on a nub toggles the secondary bus reset of that nub's PARENT bridge, so it resets everything below that bridge.
+//   level 0: the GPU's nub (dext selector 5 of the GPU user client, no open session needed). Levels above 0 are reserved for bridge nubs higher up the path.
+//   type = 0 is a query, nothing is reset: status 0, resp0 = number of levels above the GPU the server can reset (valid levels are 0..resp0), resp1 = 1.
+//   type != 0 (tIOPCIDeviceResetTypes: 1 hot reset, 2 warm, 4 warm disable, 8 warm enable, 0x10 function), options (1: terminate the nubs below the bridge and
+//     re-probe the bus): status 0, resp0 = 0, resp1 = 1. Failed: status 1, resp1 = 1, resp0 = the kern_return_t (0xE00002C0 no such level,
+//     0xE00002C2 type or options above 32 bits, 0xE00002C7 a GPU dext without selector 5, else what Reset returned).
+// Success does not prove the device came back: IOPCIDevice::Reset ignores the result of its wait for the link. With options & 1 the dext terminates
+// asynchronously and this server exits after it answered (the client sees the connection close).
+
 // Constants and state
 
 #define BULK_BUF_SIZE (64 << 20)
@@ -54,6 +65,7 @@ typedef struct { uint8_t status; uint64_t resp0, resp1; } __attribute__((packed)
 #define MAX_SYSMEM 128           // live DMA blocks per client
 #define MAP_FD_ALIGN (16 << 10)
 #define MAX_SEGMENTS 32          // the dext's IODMACommand answer
+#define KR_NO_DEVICE    0xE00002C0u   // kIOReturnNoDevice
 #define KR_BAD_ARGUMENT 0xE00002C2u   // kIOReturnBadArgument
 #define KR_UNSUPPORTED  0xE00002C7u   // kIOReturnUnsupported
 #define RELEASE_MAGIC 0x52454C444D410001ull // the dext appends (RELEASE_MAGIC, slot) to its address table when it has ReleaseDMA
@@ -61,6 +73,7 @@ typedef struct { uint8_t status; uint64_t resp0, resp1; } __attribute__((packed)
 static uint8_t g_bulk_buf[BULK_BUF_SIZE];
 static io_connect_t g_conn = IO_OBJECT_NULL;
 static int g_client_active = 0;
+static volatile int g_terminating = 0, g_exit_pending = 0; // a link reset with the terminate option is in flight / the dext went away meanwhile
 
 static struct { mach_vm_address_t addr; mach_vm_size_t size; } g_bars[MAX_BARS];
 // a live block: made by MAP_SYSMEM_FD (shm_fd >= 0, the server owns the shm object) or MAP_FD (shm_fd = -1, the client owns the memory)
@@ -124,7 +137,9 @@ static void send_error(int fd, const char *msg) {
 // Driver interface
 
 static void on_disconnect(void *refcon, io_service_t svc, uint32_t msg, void *arg) {
-  if (msg == kIOMessageServiceIsTerminated) _exit(0);
+  if (msg != kIOMessageServiceIsTerminated) return;
+  __atomic_store_n(&g_exit_pending, 1, __ATOMIC_SEQ_CST);
+  if (!__atomic_load_n(&g_terminating, __ATOMIC_SEQ_CST)) _exit(0); // else end_link_reset exits once the answer of the reset that terminates the dext went out
 }
 
 static io_connect_t open_tinygpu(void) {
@@ -251,6 +266,27 @@ static void unmap_sysmem(uint64_t idx, response_t *resp) {
   memset(&g_sysmem[idx], 0, sizeof(g_sysmem[idx]));
 }
 
+// see the protocol notes above. status 0 on a query or a reset that returned success, else status 1 and resp0 = the kern_return_t. resp1 = 1 always.
+static void reset_link(const request_t *req, response_t *resp) {
+  uint32_t kr = KERN_SUCCESS;
+  resp->resp1 = 1;
+  if (!req->arg1) return; // a query: no level above the GPU is reachable, nothing is opened
+  if ((req->arg1 | req->arg2) >> 32) kr = KR_BAD_ARGUMENT;
+  else if (req->arg0 != 0) kr = KR_NO_DEVICE;
+  else {
+    uint64_t in[2] = {req->arg1, req->arg2};
+    if (req->arg2 & 1) __atomic_store_n(&g_terminating, 1, __ATOMIC_SEQ_CST);
+    kr = dext_call(5, in, 2);
+  }
+  if (kr != KERN_SUCCESS) { resp->status = 1; resp->resp0 = kr; }
+}
+
+// after the answer of a link reset went out: a terminate notification that arrived while it ran ends the server now (the client expects the connection to close)
+static void end_link_reset(void) {
+  __atomic_store_n(&g_terminating, 0, __ATOMIC_SEQ_CST);
+  if (__atomic_load_n(&g_exit_pending, __ATOMIC_SEQ_CST)) _exit(0);
+}
+
 static int validate_bar(uint8_t bar, uint64_t off, uint64_t sz) {
   return (bar < MAX_BARS && g_bars[bar].addr && off + sz <= g_bars[bar].size && sz <= BULK_BUF_SIZE) ? 0 : -1;
 }
@@ -316,6 +352,12 @@ static void handle_client(int fd) {
       send(fd, tab, 8 + nseg * 16, 0); // nseg, then the (address, length) pairs
       continue;
     }
+
+    case CMD_RESET_LINK:
+      reset_link(&req, &resp);
+      send_response(fd, &resp, -1);
+      end_link_reset();
+      continue;
 
     case CMD_CFG_READ: {
       uint64_t in[2] = {req.arg0, req.arg1};

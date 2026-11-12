@@ -188,6 +188,10 @@ kern_return_t TinyGPUDriverUserClient::ExternalMethod(uint64_t selector, IOUserC
 		d.dmaCmd = nullptr;
 		os_log(OS_LOG_DEFAULT, "tinygpu: ReleaseDMA slot=%llu", slot);
 		return kIOReturnSuccess;
+	} else if (selector == TinyGPURPC::ResetLink) {
+		// scalar in = [type, options] of IOPCIDevice::Reset on the GPU's nub (everything below its parent bridge is reset); the kern_return of Reset comes back unchanged
+		if (args->scalarInputCount != 2) return kIOReturnBadArgument;
+		return ivars->provider->ResetLink(uint32_t(args->scalarInput[0]), uint32_t(args->scalarInput[1]));
 	}
 
 	return kIOReturnUnsupported;

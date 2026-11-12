@@ -3,6 +3,8 @@
 // slots reused lowest first, (RELEASE_MAGIC, slot) after the address table, every mapping freed when the connection closes.
 // Environment: MOCK_ARENA_MIB, MOCK_SEG_MIB (split every mapping into segments of that size), MOCK_OLD_DEXT=1 (a dext without ReleaseDMA:
 // no magic, selector 4 unsupported), MOCK_FAIL_RELEASE=N (the Nth ReleaseDMA fails with kIOReturnBusy and leaves the mapping).
+// Link reset: selector 5 (ResetLink, the GPU's nub) appends the line `0 <type> <options>` to the file MOCK_LOG and returns MOCK_RESET_KR (default 0);
+// MOCK_TERMINATE_NOTIFY=1 delivers kIOMessageServiceIsTerminated from inside a reset that has options & 1.
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -43,12 +45,13 @@ static int arena_alloc(uint64_t size, uint64_t *iova) { // lowest free run of `s
 
 static void free_all(void) { memset(slots, 0, sizeof slots); nslots = 0; release_calls = 0; }
 
+static IOServiceInterestCallback term_cb;
 CFMutableDictionaryRef IOServiceNameMatching(const char *name) { (void)name; return NULL; }
 io_service_t IOServiceGetMatchingService(mach_port_t p, CFDictionaryRef m) { (void)p; (void)m; return 1; }
 IONotificationPortRef IONotificationPortCreate(mach_port_t p) { (void)p; return (IONotificationPortRef)1; }
 void IONotificationPortSetDispatchQueue(IONotificationPortRef n, dispatch_queue_t q) { (void)n; (void)q; }
 kern_return_t IOServiceAddInterestNotification(IONotificationPortRef n, io_service_t s, const io_name_t t, IOServiceInterestCallback c, void *r, io_object_t *o) {
-  (void)n; (void)s; (void)t; (void)c; (void)r; *o = 1; return 0;
+  (void)n; (void)s; (void)t; (void)r; term_cb = c; *o = 1; return 0;
 }
 kern_return_t IOObjectRelease(io_object_t o) { (void)o; return 0; }
 kern_return_t IOServiceOpen(io_service_t s, task_port_t t, uint32_t type, io_connect_t *c) { (void)s; (void)t; (void)type; free_all(); *c = 1; return 0; }
@@ -67,6 +70,15 @@ kern_return_t IOConnectCallMethod(mach_port_t c, uint32_t sel, const uint64_t *i
   switch (sel) {
   case 0: if (in_cnt != 2 || *out_cnt < 1) return KR_BAD_ARG; out[0] = in[0] == 0 ? 0x1002 : 0; *out_cnt = 1; return 0; // CfgRead: vendor id
   case 1: case 2: return 0; // CfgWrite, Reset
+  case 5: { // ResetLink: logs the line `0 <type> <options>` to the file MOCK_LOG, returns MOCK_RESET_KR (default 0); a dext without it: unsupported
+    if (env_u64("MOCK_OLD_DEXT", 0)) return KR_UNSUPPORTED;
+    if (in_cnt != 2) return KR_BAD_ARG;
+    kern_return_t kr = (kern_return_t)env_u64("MOCK_RESET_KR", 0);
+    const char *log = getenv("MOCK_LOG");
+    if (log && *log) { FILE *f = fopen(log, "a"); if (f) { fprintf(f, "0 %llu %llu\n", in[0], in[1]); fclose(f); } }
+    if (kr == 0 && (in[1] & 1) && env_u64("MOCK_TERMINATE_NOTIFY", 0) && term_cb) term_cb(NULL, 1, kIOMessageServiceIsTerminated, NULL);
+    return kr;
+  }
   case 4: { // ReleaseDMA
     if (env_u64("MOCK_OLD_DEXT", 0)) return KR_UNSUPPORTED;
     if (in_cnt != 1 || in[0] >= (uint64_t)nslots || !slots[in[0]].live) return KR_BAD_ARG;
