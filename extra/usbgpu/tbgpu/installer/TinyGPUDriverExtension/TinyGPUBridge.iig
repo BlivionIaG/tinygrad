@@ -1,0 +1,26 @@
+#ifndef TinyGPUBridge_h
+#define TinyGPUBridge_h
+
+#include <Availability.h>
+#include <DriverKit/IOService.iig>
+#include <PCIDriverKit/IOPCIDevice.iig>
+
+// A second personality of the same dext, bound to a bridge nub on the path to the GPU (the ASM2464PD ports, the switch on the card). It only exists to call
+// IOPCIDevice::Reset on that nub: it never opens the nub, never touches its config space, never maps or DMAs anything.
+class TinyGPUBridge: public IOService
+{
+public:
+	virtual bool init() override;
+
+	virtual void free() override;
+
+	virtual kern_return_t Start(IOService * provider) override;
+
+	virtual kern_return_t Stop(IOService * provider) override;
+
+	virtual kern_return_t NewUserClient(uint32_t in_type, IOUserClient** out_user_client) override;
+
+	kern_return_t ResetLink(uint32_t type, uint32_t options) LOCALONLY;
+};
+
+#endif /* TinyGPUBridge_h */

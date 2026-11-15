@@ -92,13 +92,14 @@ error:
 	return err;
 }
 
-kern_return_t TinyGPUDriver::MapBar(uint32_t bar, IOMemoryDescriptor** memory)
+kern_return_t TinyGPUDriver::MapBar(uint32_t bar, bool writeCombined, IOMemoryDescriptor** memory)
 {
 	uint8_t barMemoryIndex, barMemoryType;
 	uint64_t barMemorySize;
 	kern_return_t err = ivars->pci->GetBARInfo(bar, &barMemoryIndex, &barMemorySize, &barMemoryType);
 	if (err) return err;
-	os_log(OS_LOG_DEFAULT, "tinygpu: bar mapping %d idx=%d", bar, barMemoryIndex);
+	os_log(OS_LOG_DEFAULT, "tinygpu: bar mapping %d idx=%d wc=%d", bar, barMemoryIndex, writeCombined);
+	if (writeCombined) return ivars->pci->_CopyWCDeviceMemoryWithIndex(barMemoryIndex, memory, this);
 	return ivars->pci->_CopyDeviceMemoryWithIndex(barMemoryIndex, memory, this);
 }
 
@@ -190,6 +191,16 @@ kern_return_t TinyGPUDriver::ResetDevice()
 	if (!ivars->pci) return kIOReturnNotReady;
 	kern_return_t ret = ivars->pci->Reset(kIOPCIDeviceResetTypeFunctionReset);
 	return ret == kIOReturnSuccess ? ret : ivars->pci->Reset(kIOPCIDeviceResetTypeHotReset);
+}
+
+// Reset(type, options) on this nub: the secondary bus reset of its parent bridge, so it resets everything below that bridge. Needs no open session.
+// kIOPCIDeviceResetOptionTerminate (options & 1) has the kernel terminate the nubs below the bridge and re-probe the bus: this dext goes away with them.
+kern_return_t TinyGPUDriver::ResetLink(uint32_t type, uint32_t options)
+{
+	if (!ivars->pci) return kIOReturnNotReady;
+	kern_return_t ret = ivars->pci->Reset(type, options);
+	os_log(OS_LOG_DEFAULT, "tinygpu: ResetLink type=0x%x options=0x%x result=0x%08x", type, options, ret);
+	return ret;
 }
 
 IOPCIDevice* TinyGPUDriver::GetPCI()

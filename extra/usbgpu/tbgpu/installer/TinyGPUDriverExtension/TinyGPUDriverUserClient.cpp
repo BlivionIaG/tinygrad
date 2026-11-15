@@ -32,7 +32,23 @@ struct TinyGPUDriverUserClient_IVars
 		dmaCap = newCap;
 		return 0;
 	}
+
+	// a slot for a new PrepareDMA mapping: the lowest one ReleaseDMA emptied, else a new one at the end (not committed until dmas[slot] is written)
+	int findDMASlot(size_t *slot)
+	{
+		for (size_t i = 0; i < dmaCount; i++) {
+			if (!dmas[i].dmaCmd && !dmas[i].sharedBuf) { *slot = i; return 0; }
+		}
+		*slot = dmaCount;
+		return ensureDMACap(dmaCount + 1);
+	}
 };
+
+// PrepareDMA appends these two words after the (0, 0) that ends its address table: a server that sees the magic knows ReleaseDMA exists and which slot to name
+static const uint64_t kReleaseDMAMagic = 0x52454C444D410001ull;
+
+// IOConnectMapMemory64 type of a write-combined BAR: kBarTypeWC | bar
+static const uint64_t kBarTypeWC = 0xF0000100ull;
 
 bool TinyGPUDriverUserClient::init()
 {
@@ -135,7 +151,8 @@ kern_return_t TinyGPUDriverUserClient::ExternalMethod(uint64_t selector, IOUserC
 			os_log(OS_LOG_DEFAULT, "tinygpu: PrepareDMA requires buffers >= 4097 bytes");
 			return kIOReturnBadArgument;
 		}
-		if (ivars->ensureDMACap(ivars->dmaCount + 1)) return kIOReturnNoMemory;
+		size_t slot = 0;
+		if (ivars->findDMASlot(&slot)) return kIOReturnNoMemory;
 
 		uint64_t size = 0;
 		args->structureInputDescriptor->GetLength(&size);
@@ -154,10 +171,35 @@ kern_return_t TinyGPUDriverUserClient::ExternalMethod(uint64_t selector, IOUserC
 		uint64_t* out = (uint64_t*)outMap->GetAddress();
 		for (uint32_t i = 0; i < segCount; i++) { out[i * 2] = segments[i].address; out[i * 2 + 1] = segments[i].length; }
 		out[segCount * 2] = 0; out[segCount * 2 + 1] = 0;
+		out[segCount * 2 + 2] = kReleaseDMAMagic; out[segCount * 2 + 3] = slot;
 		outMap->release();
 
-		os_log(OS_LOG_DEFAULT, "tinygpu: PrepareDMA size=%llu segs=%u", size, segCount);
-		ivars->dmas[ivars->dmaCount++] = {nullptr, dmaCmd};
+		os_log(OS_LOG_DEFAULT, "tinygpu: PrepareDMA size=%llu segs=%u slot=%zu", size, segCount, slot);
+		ivars->dmas[slot] = {nullptr, dmaCmd};
+		if (slot == ivars->dmaCount) ivars->dmaCount++;
+		return kIOReturnSuccess;
+	} else if (selector == TinyGPURPC::ReleaseDMA) {
+		// scalar in[0] = the slot PrepareDMA reported: gives the mapping back (DART unmap). The caller guarantees the device no longer uses it.
+		if (args->scalarInputCount != 1) return kIOReturnBadArgument;
+		uint64_t slot = args->scalarInput[0];
+		if (slot >= ivars->dmaCount) return kIOReturnBadArgument;
+		auto &d = ivars->dmas[slot];
+		if (!d.dmaCmd || d.sharedBuf) return kIOReturnBadArgument; // empty, or made by CreateDMA (those live until the client closes)
+		err = d.dmaCmd->CompleteDMA(kIODMACommandCompleteDMANoOptions);
+		if (err) { os_log(OS_LOG_DEFAULT, "tinygpu: ReleaseDMA slot=%llu failed err=%d", slot, err); return err; } // still mapped, still ours
+		d.dmaCmd->release();
+		d.dmaCmd = nullptr;
+		os_log(OS_LOG_DEFAULT, "tinygpu: ReleaseDMA slot=%llu", slot);
+		return kIOReturnSuccess;
+	} else if (selector == TinyGPURPC::ResetLink) {
+		// scalar in = [type, options] of IOPCIDevice::Reset on the GPU's nub (everything below its parent bridge is reset); the kern_return of Reset comes back unchanged
+		if (args->scalarInputCount != 2) return kIOReturnBadArgument;
+		return ivars->provider->ResetLink(uint32_t(args->scalarInput[0]), uint32_t(args->scalarInput[1]));
+	} else if (selector == TinyGPURPC::Features) {
+		// scalar out[0] = feature bits of this dext: bit 0 = a BAR can be mapped write-combined (user-client memory type kBarTypeWC | bar)
+		if (args->scalarOutputCount < 1) return kIOReturnBadArgument;
+		args->scalarOutput[0] = 1;
+		args->scalarOutputCount = 1;
 		return kIOReturnSuccess;
 	}
 
@@ -169,10 +211,15 @@ kern_return_t IMPL(TinyGPUDriverUserClient, CopyClientMemoryForType)
 	if (!memory) return kIOReturnBadArgument;
 	if (!ivars->provider.get()) return kIOReturnNotAttached;
 
-	// bar handling, type is bar num
+	// bar handling, type is bar num; the same BAR write-combined is kBarTypeWC | bar (above every DMA size, which the DART caps at 2047 MiB)
 	if (type < 6) {
 		uint32_t bar = (uint32_t)type;
-		return ivars->provider->MapBar(bar, memory);
+		return ivars->provider->MapBar(bar, false, memory);
+	}
+	if ((type & ~0xFFull) == kBarTypeWC) {
+		uint32_t bar = (uint32_t)(type & 0xFF);
+		if (bar >= 6) return kIOReturnBadArgument;
+		return ivars->provider->MapBar(bar, true, memory);
 	}
 
 	// dma handling, type is size

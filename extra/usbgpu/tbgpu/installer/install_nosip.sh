@@ -21,14 +21,19 @@ echo "SIP is disabled, proceeding with dev build..."
 
 cd "$(dirname "$0")"
 
+# TINYGPU_BRIDGE=1 also builds the optional TinyGPUBridge personality (PCIe link reset of the bridges on the path to the GPU) and signs the dext with the
+# restricted com.apple.developer.driverkit.transport.pci.bridge entitlement, which only loads on a machine that accepts it. The default build has neither.
+BRIDGE_ARGS=(); ENT_SUFFIX=""
+if [[ "${TINYGPU_BRIDGE:-0}" == "1" ]]; then BRIDGE_ARGS=(TINYGPU_BRIDGE=YES); ENT_SUFFIX=".Bridge"; fi
+
 # Build without code signing
-xcodebuild clean build CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO -alltargets -configuration Debug build
+xcodebuild clean build CODE_SIGN_IDENTITY="" CODE_SIGNING_REQUIRED=NO ${BRIDGE_ARGS[@]+"${BRIDGE_ARGS[@]}"} -alltargets -configuration Debug build
 
 APP_PATH="./build/Debug/TinyGPU.app"
 DEXT_PATH="$APP_PATH/Contents/Library/SystemExtensions/org.tinygrad.tinygpu.driver2.dext"
 
 # Ad-hoc sign with dev entitlements (matches any GPU)
-codesign --sign - --entitlements ./TinyGPUDriverExtension/TinyGPUDriver.NoSIP.entitlements --force --timestamp --verbose "$DEXT_PATH"
+codesign --sign - --entitlements "./TinyGPUDriverExtension/TinyGPUDriver.NoSIP$ENT_SUFFIX.entitlements" --force --timestamp --verbose "$DEXT_PATH"
 codesign --sign - --entitlements ./macOS/macOS.entitlements --force --timestamp --verbose "$APP_PATH"
 
 echo "Build complete: $APP_PATH"

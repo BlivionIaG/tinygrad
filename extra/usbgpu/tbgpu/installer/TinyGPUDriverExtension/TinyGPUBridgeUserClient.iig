@@ -1,0 +1,22 @@
+#ifndef TinyGPUBridgeUserClient_h
+#define TinyGPUBridgeUserClient_h
+
+#include <DriverKit/IOUserClient.iig>
+
+// the user client of TinyGPUBridge: only the ResetLink selector (TinyGPURPC::ResetLink of TinyGPUDriverUserClient.iig)
+class TinyGPUBridgeUserClient : public IOUserClient
+{
+public:
+	virtual bool init() final;
+	virtual void free() final;
+
+	virtual kern_return_t Start(IOService* in_provider) final;
+	virtual kern_return_t Stop(IOService* in_provider) final;
+
+	virtual kern_return_t ExternalMethod(uint64_t in_selector, IOUserClientMethodArguments* in_arguments, const IOUserClientMethodDispatch* in_dispatch, OSObject* in_target, void* in_reference) final;
+
+	virtual kern_return_t CopyClientMemoryForType(
+		uint64_t type, uint64_t *options, IOMemoryDescriptor **memory) final;
+};
+
+#endif /* TinyGPUBridgeUserClient_h */
