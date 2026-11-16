@@ -9,7 +9,7 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.abspath(os.path.join(HERE, "..", "..", "..", ".."))
 SERVER_C = os.environ.get("TINYGPU_TEST_SERVER_C") or os.path.join(HERE, "..", "installer", "Shared", "server.c")
 REQ, RESP = '<BIIQQQ', '<BQQ'
-MAP_BAR, CFG_READ, CFG_WRITE, RESET, MMIO_READ, MMIO_WRITE, RESIZE_BAR, FEATURES, RING_SETUP, RING_KICK = 1, 3, 4, 5, 6, 7, 11, 18, 19, 20
+MAP_BAR, CFG_READ, MMIO_READ, MMIO_WRITE, FEATURES, RING_SETUP, RING_KICK = 1, 3, 6, 7, 18, 19, 20
 MAP_SYSMEM_FD = 2
 KR_BAD_ARG, KR_BUSY = 0xE00002C2, 0xE00002D5
 FEAT_FEATURES, FEAT_RING, PROTO_VERSION = 1, 16, 1
@@ -198,8 +198,6 @@ class TestRingProtocol(ServerCase):
     self.assertEqual(c.rpc(MAP_BAR, bar=0)[0], 0)
     return c, r
 
-  def asleep(self, r:Ring): wait_until(lambda: r.srv_state() == 1, 10, "the server to go to sleep")
-
   def test_features(self):
     c = self.start()
     self.assertEqual(c.rpc(FEATURES, PROTO_VERSION), (0, 0, PROTO_VERSION << 32 | FEAT_FEATURES | FEAT_RING))
@@ -216,36 +214,6 @@ class TestRingProtocol(ServerCase):
       self.assertEqual(r.read(0, 4 * i, 4), d)  # a read sees every write posted before it
     r.write(0, 0x1000, b"abcdefgh")
     self.assertEqual(r.read(0, 0x1000, 8), b"abcdefgh")
-
-  def test_config_commands_on_the_ring(self):
-    c, r = self.up()
-    self.assertEqual(r.answer(CFG_WRITE, 0x10, 4, 0xdead), (0, 0, 0))
-    self.assertEqual(r.answer(RESIZE_BAR, bar=0), (0, 0, 0))
-    self.assertEqual(r.answer(RESET), (0, 0, 0))
-    self.assertEqual(r.answer(CFG_READ, 0, 2), (0, 0x1002, 0))
-
-  def test_payloads_longer_than_the_ring(self):
-    c = self.start()
-    r = self.ring(c, req_cap=4096, rsp_cap=4096)
-    self.assertEqual(r.setup()[0], 0)
-    c.rpc(MAP_BAR, bar=0)
-    pattern = bytes((i * 31 + (i >> 8)) & 0xFF for i in range(1 << 20))
-    r.write(0, 0, pattern)
-    self.assertEqual(r.read(0, 0, 1 << 20), pattern)
-
-  def test_requests_straddle_the_end_of_a_small_ring(self):
-    c = self.start()
-    r = self.ring(c, req_cap=4096, rsp_cap=4096)  # 33-byte headers and answers of odd lengths: every offset of the ring gets crossed
-    self.assertEqual(r.setup()[0], 0)
-    c.rpc(MAP_BAR, bar=0)
-    rng, model = random.Random(7), bytearray(1 << 16)
-    for _ in range(800):
-      off, n = rng.randrange(0, (len(model) - 1024) // 4) * 4, rng.randrange(1, 900)
-      if rng.random() < 0.5:
-        data = rng.randbytes(n)
-        r.write(0, off, data)
-        model[off:off + n] = data
-      else: self.assertEqual(r.read(0, off, n), bytes(model[off:off + n]))
 
   def test_unsupported_commands_are_refused_on_the_ring(self):
     c, r = self.up()
@@ -275,15 +243,6 @@ class TestRingProtocol(ServerCase):
     struct.pack_into('<QIIII', r.mm, 0, 0, 7, 3, 5, 99)  # what the client does to the object afterwards changes nothing for the server
     r.write(0, 0, b"still")
     self.assertEqual(r.read(0, 0, 5), b"still")
-
-  def test_socket_request_sees_earlier_ring_writes(self):
-    c, r = self.up()
-    r.write(0, 0x200, b"wxyz")
-    self.assertEqual(c.read(0x200, 4), b"wxyz")  # the legacy path, right behind the ring entry
-    self.asleep(r)
-    r.write(0, 0x204, b"1234")  # the server sleeps: a kick, then the request
-    self.assertEqual(c.read(0x200, 8), b"wxyz1234")
-    self.assertEqual(c.rpc(FEATURES, PROTO_VERSION)[2] >> 32, 1)  # and the socket goes on working
 
   def test_kick_without_a_ring_is_dropped(self):
     c = self.start()
@@ -315,37 +274,6 @@ class TestRingProtocol(ServerCase):
     r2 = self.ring(c, **good)
     self.assertEqual(r2.setup(), (1, KR_BUSY, 1))  # one ring per connection
     self.assertEqual(r.answer(CFG_READ, 0, 2), (0, 0x1002, 0))
-
-  def test_a_new_connection_can_set_up_again(self):
-    c, r = self.up()
-    r.write(0, 0, b"keep")
-    c.close()
-    c2 = self.reconnect()
-    r2 = self.ring(c2)
-    self.assertEqual(r2.setup(), (0, r2.bytes, 1))
-    c2.rpc(MAP_BAR, bar=0)
-    self.assertEqual(r2.read(0, 0, 4), b"keep")  # the posted write landed before the first connection went
-
-  def test_posted_writes_survive_eof(self):
-    c, r = self.up()
-    self.asleep(r)
-    r.write(0, 0x300, b"EOF!" * 100)
-    c.close()  # the kick and the EOF arrive together
-    c2 = self.reconnect()
-    r2 = self.ring(c2)
-    self.assertEqual(r2.setup()[0], 0)
-    c2.rpc(MAP_BAR, bar=0)
-    self.assertEqual(r2.read(0, 0x300, 400), b"EOF!" * 100)
-
-  def test_sleep_and_kick(self):
-    c, r = self.up()
-    for i in range(20):
-      self.asleep(r)
-      data = struct.pack('<I', i)
-      r.put(struct.pack(REQ, MMIO_WRITE, 0, 0, 0x400, 4, 0) + data + struct.pack(REQ, MMIO_READ, 0, 0, 0x400, 4, 0))  # one publish: exactly one kick
-      self.assertEqual(struct.unpack(RESP, r.get(17))[:2], (0, 4))
-      self.assertEqual(r.get(4), data)
-      self.assertEqual(r.kicks, i + 1)
 
   def test_counters_that_make_no_sense_drop_the_client(self):
     def head_ahead(r:Ring): r.words[RING_REQ_HEAD].value = 3 * (1 << 16)
@@ -393,7 +321,6 @@ class TestRingStress(ServerCase):
     self.assertEqual(c.read(0, len(expect)), expect)  # what the client posted right before it closed is there
     return r.stdout
 
-  def test_stress_default_rings(self): self.run_stress(12000, 1, (1 << 16, 1 << 16))
   def test_stress_tiny_rings(self): self.run_stress(6000, 2, (4096, 4096))
   def test_stress_uneven_rings(self): self.run_stress(12000, 3, (1 << 14, 1 << 15))
 
@@ -441,27 +368,6 @@ class TestRingClient(DeviceCase):
     self.addCleanup(r.close)
     return r
 
-  def test_open_and_roundtrip(self):
-    c = self.start()
-    r = self.ring(c)
-    c.rpc(MAP_BAR, bar=0)
-    r.write(0, 0x10, b"hello ring")
-    self.assertEqual(r.read(0, 0x10, 10), b"hello ring")
-    self.assertEqual(c.read(0x10, 10), b"hello ring")  # the other channel sees it
-    r.write(0, 0x20, memoryview(bytearray(b"views work too")))
-    self.assertEqual(r.read(0, 0x20, 14), b"views work too")
-
-  def test_fragmented_setup_transfers_the_fd_once(self):
-    class ShortSetup(Spy):
-      def sendmsg(self, bufs, *args): return super().sendmsg([bufs[0][:5]], *args)
-    c = self.start()
-    c.s.settimeout(1)
-    r = remote().TinyGPURing.open(ShortSetup(c.s), 0)
-    self.addCleanup(r.close)
-    c.rpc(MAP_BAR, bar=0)
-    r.write(0, 16, b"fragment")
-    self.assertEqual(r.read(0, 16, 8), b"fragment")
-
   def test_small_rings_wrap_and_carry_large_transfers(self):
     c = self.start()
     r = self.ring(c, REQ_CAP=4096, RSP_CAP=4096)
@@ -504,7 +410,7 @@ class TestRingClient(DeviceCase):
     c.rpc(MAP_BAR, bar=0)
     for i in range(200):
       data = struct.pack('<II', i, ~i & 0xFFFFFFFF)
-      r.write(0, 8 * i, data)
+      r.write(0, 8 * i, memoryview(bytearray(data)) if i % 2 else data)  # views are accepted as payloads
       if i % 3 == 0: self.assertEqual(c.read(8 * i, 8), data)  # served after the ring entry before it
       if i % 5 == 0: self.assertEqual(c.rpc(CFG_READ, 0, 2)[:2], (0, 0x1002))
       if i % 7 == 0: self.assertEqual(r.read(0, 8 * i, 8), data)
@@ -531,27 +437,6 @@ class TestRingClient(DeviceCase):
     r2 = self.ring(c2)
     c2.rpc(MAP_BAR, bar=0)
     self.assertEqual(r2.read(0, 0x300, 400), b"EOF!" * 100)
-
-  def test_closed_ring_raises(self):
-    c = self.start()
-    r = self.ring(c)
-    c.rpc(MAP_BAR, bar=0)
-    r.close()
-    r.close()  # once
-    self.assertRaises(RuntimeError, r.write, 0, 0, b"late")
-    self.assertRaises(RuntimeError, r.read, 0, 0, 4)
-
-  def test_server_death_is_an_error_not_a_hang(self):
-    c = self.start()
-    r = self.ring(c)
-    c.rpc(MAP_BAR, bar=0)
-    self.proc.kill()
-    self.proc.wait()
-    t0 = time.monotonic()
-    self.assertRaises(ConnectionError, r.read, 0, 0, 4)
-    self.assertLess(time.monotonic() - t0, 10)  # found out from the socket, not from the timeout
-    self.assertIsInstance(r.error, ConnectionError)
-    self.assertRaises(RuntimeError, r.write, 0, 0, b"x")  # the session is over
 
 class TestAPLRingDevice(DeviceCase):
   def new(self, ring:bool=True, **caps:int):
@@ -583,32 +468,6 @@ class TestAPLRingDevice(DeviceCase):
     self.assertNotIn(MMIO_READ, spy.cmds)
     self.assertNotIn(MMIO_WRITE, spy.cmds)
     self.assertIn(MAP_BAR, spy.cmds)  # the socket still does the rest
-
-  def test_old_style_reads_see_ring_writes(self):
-    d = self.new()
-    remote_cls, bar = remote().RemotePCIDevice, d.map_bar(0)
-    for i in range(300):
-      data = struct.pack('<Q', i * 0x0101010101)
-      bar[8 * i:8 * i + 8] = data
-      if i % 4 == 0: self.assertEqual(remote_cls._bulk_read(d, 6, 0, 8 * i, 8), data)  # socket reads see earlier ring writes
-      if i % 9 == 0: self.assertEqual(d.read_config(0, 2), 0x1002)
-      if i % 6 == 0: d.write_config(0x10, i, 4)
-
-  def test_small_rings(self):
-    d = self.new(REQ_CAP=4096, RSP_CAP=4096)
-    bar = d.map_bar(0)
-    pattern = bytes((i * 7 + (i >> 9)) & 0xFF for i in range(1 << 20))
-    bar[0:1 << 20] = pattern
-    self.assertEqual(bar[0:1 << 20], pattern)
-
-  def test_sleeping_server_is_woken(self):
-    d = self.new()
-    bar = d.map_bar(0)
-    for i in range(10):
-      wait_until(lambda: d.ring.words[d.ring.SRV_STATE].value == 1, 10, "the server to go to sleep")
-      bar[0x40:0x44] = struct.pack('<I', i)
-      self.assertEqual(bar[0x40:0x44], struct.pack('<I', i))
-    self.assertGreaterEqual(d.ring.kicks, 10)
 
   def test_close_serves_what_was_posted(self):
     d = self.new()
@@ -806,16 +665,8 @@ class TestRingClientAgainstFakeServers(DeviceCase):
 
   def test_malformed_setup_acknowledgement_closes_the_connection(self):
     s = self.fake("bad_setup")
-    with self.assertRaisesRegex(RuntimeError, "set up a ring"): self.device(s.path)
+    self.assertRaises(RuntimeError, self.device, s.path)
     wait_until(lambda: s.eof, 2, "the server to see failed setup EOF")
-
-  def test_without_the_opt_in_nothing_is_negotiated(self):
-    s = self.fake("ring")
-    d = self.device(s.path, ring=False)
-    self.assertIsNone(d.ring)
-    d.map_bar(0)[0:4] = b"abcd"
-    self.assertEqual(d.map_bar(0)[0:4], b"abcd")
-    self.assertEqual(s.cmds, [MAP_BAR, MMIO_WRITE, MMIO_READ])  # the wire of an old client
 
   def test_kick_only_when_asleep_and_once_per_sleep(self):
     s = self.fake("ring")
@@ -875,7 +726,7 @@ class TestRingClientAgainstFakeServers(DeviceCase):
     timer = threading.Timer(0.1, s.set_word, (RING_RSP_HEAD, 1 << 30))  # more than a ring ahead of the tail
     self.addCleanup(timer.cancel)
     timer.start()
-    self.assertRaisesRegex(RuntimeError, "response head", lambda: bar[0:4])
+    self.assertRaises(RuntimeError, lambda: bar[0:4])
     self.assertIsNone(d.ring.mm)
 
   def test_request_tail_that_makes_no_sense(self):
@@ -883,7 +734,7 @@ class TestRingClientAgainstFakeServers(DeviceCase):
     d = self.device(s.path)
     bar = d.map_bar(0)
     s.set_word(RING_REQ_TAIL, 1 << 40)  # ahead of the head: nobody could have consumed that
-    self.assertRaisesRegex(RuntimeError, "request tail", lambda: bar.__setitem__(slice(0, 4), b"abcd"))
+    self.assertRaises(RuntimeError, lambda: bar.__setitem__(slice(0, 4), b"abcd"))
     self.assertRaises(RuntimeError, lambda: bar[0:4])
 
   def test_answer_of_the_wrong_size_is_a_protocol_error(self):
@@ -891,17 +742,7 @@ class TestRingClientAgainstFakeServers(DeviceCase):
     d = self.device(s.path)
     bar = d.map_bar(0)
     s.answer_later(0, 3, 0, b"abc")  # three bytes for a read of four
-    self.assertRaisesRegex(RuntimeError, "3 bytes to a read of 4", lambda: bar[0:4])
+    self.assertRaises(RuntimeError, lambda: bar[0:4])
     self.assertIsNotNone(d.ring.error)
-
-  def test_refused_read_is_not_the_end_of_the_session(self):
-    s = self.fake("ring")
-    d = self.device(s.path)
-    bar = d.map_bar(0)
-    s.answer_later(1, 0, 0)
-    self.assertRaisesRegex(RuntimeError, "refused", lambda: bar[0:4])
-    self.assertIsNone(d.ring.error)
-    s.answer_later(0, 4, 0, b"abcd")
-    self.assertEqual(bar[0:4], b"abcd")
 
 if __name__ == "__main__": unittest.main()

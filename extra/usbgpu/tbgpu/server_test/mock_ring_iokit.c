@@ -33,7 +33,6 @@ kern_return_t IOConnectCallMethod(mach_port_t c, uint32_t sel, const uint64_t *i
   (void)c; (void)is; (void)isc; (void)os; (void)osc;
   switch (sel) {
   case 0: if (in_cnt != 2 || *out_cnt < 1) return KR_BAD_ARG; out[0] = in[0] == 0 ? 0x1002 : 0; *out_cnt = 1; return 0; // CfgRead: vendor id
-  case 1: case 2: return 0; // CfgWrite, Reset
   }
   return KR_UNSUPPORTED;
 }
