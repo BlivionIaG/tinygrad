@@ -1,8 +1,9 @@
-// Shared IOKit test double: no dext or GPU. BARs are ordinary memory. Optional DMA emulation supports the release/import tests:
+// IOKit test double for server.c: no dext or GPU. BARs are ordinary memory. DMA emulation supports the release/import tests:
 // an IOVA arena of MOCK_ARENA_MIB (default 2047), lowest-free slots, and (RELEASE_MAGIC, slot) after the address table.
 // All emulated mappings are freed when the connection closes; this does not imply the installed dext supports ReleaseDMA.
 // Environment: MOCK_ARENA_MIB, MOCK_SEG_MIB (split every mapping into segments of that size), MOCK_OLD_DEXT=1 (a dext without ReleaseDMA:
 // no magic, selector 4 unsupported), MOCK_FAIL_RELEASE=N (the Nth ReleaseDMA fails with kIOReturnBusy and leaves the mapping).
+// MOCK_SLOT_BASE offsets dext slot IDs to detect confusing them with server block indexes.
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -22,7 +23,7 @@
 
 static struct { int live; uint64_t iova, size; } slots[MAX_SLOTS];
 static int nslots, release_calls;
-static void *bar_mem[6];
+static uint8_t bar_mem[6][1 << 20];
 const mach_port_t kIOMainPortDefault = 0;
 
 static uint64_t env_u64(const char *n, uint64_t d) { const char *v = getenv(n); return v && *v ? strtoull(v, NULL, 0) : d; }
@@ -56,8 +57,7 @@ kern_return_t IOServiceClose(io_connect_t c) { (void)c; free_all(); return 0; } 
 kern_return_t IOConnectMapMemory64(io_connect_t c, uint32_t type, task_port_t t, mach_vm_address_t *a, mach_vm_size_t *s, IOOptionBits o) {
   (void)c; (void)t; (void)o;
   if (type >= 6) return KR_BAD_ARG;
-  if (!bar_mem[type]) bar_mem[type] = calloc(1, 1 << 20);
-  *a = (mach_vm_address_t)bar_mem[type]; *s = 1 << 20;
+  *a = (mach_vm_address_t)bar_mem[type]; *s = sizeof(bar_mem[type]);
   return 0;
 }
 kern_return_t IOConnectUnmapMemory64(io_connect_t c, uint32_t type, task_port_t t, mach_vm_address_t a) { (void)c; (void)type; (void)t; (void)a; return 0; }
@@ -69,9 +69,11 @@ kern_return_t IOConnectCallMethod(mach_port_t c, uint32_t sel, const uint64_t *i
   case 1: case 2: return 0; // CfgWrite, Reset
   case 4: { // ReleaseDMA
     if (env_u64("MOCK_OLD_DEXT", 0)) return KR_UNSUPPORTED;
-    if (in_cnt != 1 || in[0] >= (uint64_t)nslots || !slots[in[0]].live) return KR_BAD_ARG;
+    if (in_cnt != 1) return KR_BAD_ARG;
+    uint64_t slot = in[0] - env_u64("MOCK_SLOT_BASE", 0);
+    if (slot >= (uint64_t)nslots || !slots[slot].live) return KR_BAD_ARG;
     if (++release_calls == (int)env_u64("MOCK_FAIL_RELEASE", 0)) return KR_BUSY;
-    slots[in[0]].live = 0;
+    slots[slot].live = 0;
     return 0;
   }
   }
@@ -93,7 +95,7 @@ kern_return_t IOConnectCallStructMethod(mach_port_t c, uint32_t sel, const void 
     if (n == 32) return KR_NO_MEMORY; // more segments than the dext's array
     t[2 * n] = iova + o; t[2 * n + 1] = (seg && in_sz - o > seg) ? seg : in_sz - o;
   }
-  if (!env_u64("MOCK_OLD_DEXT", 0)) { t[2 * n + 2] = MAGIC; t[2 * n + 3] = slot; }
+  if (!env_u64("MOCK_OLD_DEXT", 0)) { t[2 * n + 2] = MAGIC; t[2 * n + 3] = slot + env_u64("MOCK_SLOT_BASE", 0); }
   slots[slot].live = 1; slots[slot].iova = iova; slots[slot].size = in_sz;
   if (slot == nslots) nslots++;
   return 0;

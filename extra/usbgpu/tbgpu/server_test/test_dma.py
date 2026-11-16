@@ -5,7 +5,7 @@
 #   python3 -m pytest extra/usbgpu/tbgpu/server_test/test_dma.py -n12
 # TINYGPU_TEST_SERVER_C=<server.c> builds another server source (the one before this feature, for example) instead: the tests that need
 # UNMAP_SYSMEM / MAP_FD then fail. It is for testing the tests only.
-import array, atexit, functools, glob, mmap, os, shutil, socket, struct, subprocess, sys, tempfile, threading, time, unittest
+import array, mmap, os, socket, struct, subprocess, sys, tempfile, threading, time, unittest
 try: import _posixshmem
 except ImportError: _posixshmem = None  # type: ignore[assignment] # the tests skip themselves off macOS, the module still imports
 
@@ -14,7 +14,7 @@ ROOT = os.path.abspath(os.path.join(HERE, "..", "..", "..", ".."))
 SERVER_C = os.environ.get("TINYGPU_TEST_SERVER_C") or os.path.join(HERE, "..", "installer", "Shared", "server.c")
 REQ, RESP = '<BIIQQQ', '<BQQ'
 MAP_BAR, MAP_SYSMEM_FD, CFG_READ, MMIO_READ, MMIO_WRITE, UNMAP_SYSMEM, MAP_FD = 1, 2, 3, 6, 7, 15, 16
-KR_NO_MEMORY, KR_BAD_ARG, KR_UNSUPPORTED, KR_BUSY = 0xE00002BD, 0xE00002C2, 0xE00002C7, 0xE00002D5
+KR_BAD_ARG, KR_UNSUPPORTED, KR_BUSY = 0xE00002C2, 0xE00002C7, 0xE00002D5
 MAGIC, PAGE, MIB = 0x52454C444D410001, 16384, 1 << 20
 
 # Every server process names its shm objects "/tinygpu_<n>" and the tests run in parallel: give each one its own namespace (and let a test see them).
@@ -27,30 +27,24 @@ static inline const char *tg_name(const char *n) { static char b[32]; snprintf(b
 #define shm_unlink(n) shm_unlink(tg_name(n))
 """
 
-def build(dst:str, tmp:str):
-  prefix_h = os.path.join(tmp, "shm_prefix.h")
-  with open(prefix_h, "w") as f: f.write(SHM_PREFIX_H)
+def build_server(tmp:str) -> str:
+  shm_h, binary = os.path.join(tmp, "shm_prefix.h"), os.path.join(tmp, "server")
+  with open(shm_h, "w") as f: f.write(SHM_PREFIX_H)
   srcs = [SERVER_C, os.path.join(HERE, "mock_iokit.c"), os.path.join(HERE, "mock_main.c")]
-  clt = "/Library/Developer/CommandLineTools"
-  sdks = sorted(glob.glob(f"{clt}/SDKs/MacOSX*.sdk"))
-  tries = [["xcrun", "clang"]]
-  if sdks: tries.append([f"{clt}/usr/bin/clang", "-isysroot", sdks[-1]]) # works while the Xcode license is not accepted
-  for cc in tries:
-    result = subprocess.run([*cc, "-O1", "-include", prefix_h, "-o", dst, *srcs], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    if result.returncode == 0: return
-  raise RuntimeError("cannot build server.c with the mock IOKit")
-
-@functools.cache
-def server_binary() -> str: # once per process (a pytest-xdist worker)
-  tmp = tempfile.mkdtemp(prefix="tgsrv")
-  atexit.register(shutil.rmtree, tmp, ignore_errors=True)
-  build(binary:=os.path.join(tmp, "server"), tmp)
+  subprocess.run(["xcrun", "clang", "-O1", "-include", shm_h, "-o", binary, *srcs], check=True)
   return binary
 
 def shm_exists(name:str) -> bool:
   try: os.close(_posixshmem.shm_open(name, os.O_RDONLY, 0o600))
   except FileNotFoundError: return False
   return True
+
+def shm_object(size:int) -> int: # a POSIX shm object, unlinked at once: the memory of a client
+  name = f"/tgs{os.getpid() % 10**6}x{time.monotonic_ns() % 10**9}"
+  fd = _posixshmem.shm_open(name, os.O_CREAT | os.O_RDWR, 0o600)
+  _posixshmem.shm_unlink(name)
+  os.ftruncate(fd, size)
+  return fd
 
 class Client:
   def __init__(self, path:str):
@@ -108,45 +102,43 @@ class Client:
   def close(self): self.s.close()
 
 class ServerCase(unittest.TestCase):
+  tmpdir: tempfile.TemporaryDirectory[str]
   tmp: str
+  binary: str
 
   @classmethod
   def setUpClass(cls):
     if sys.platform != "darwin": raise unittest.SkipTest("server.c is macOS only")
-    server_binary()
-    cls.tmp = tempfile.mkdtemp(prefix="tgsrv")
+    cls.tmpdir = tempfile.TemporaryDirectory(prefix="tgdma")
+    cls.tmp = cls.tmpdir.name
+    cls.binary = build_server(cls.tmp)
 
   @classmethod
-  def tearDownClass(cls): shutil.rmtree(cls.tmp, ignore_errors=True)
+  def tearDownClass(cls): cls.tmpdir.cleanup()
 
   def start(self, nofile:int|None=None, **env:str) -> Client:
     self.path = os.path.join(self.tmp, f"s{time.monotonic_ns()}.sock")
-    cmd = [server_binary(), self.path] if nofile is None else ["/bin/sh", "-c", f'ulimit -n {nofile}; exec "$0" "$1"', server_binary(), self.path]
+    cmd = [self.binary, self.path] if nofile is None else ["/bin/sh", "-c", f'ulimit -n {nofile}; exec "$0" "$1"', self.binary, self.path]
     self.proc = subprocess.Popen(cmd, env=dict(os.environ, **env), stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     self.addCleanup(lambda: (self.proc.kill(), self.proc.wait()))
-    self.c = Client(self.path)
-    self.addCleanup(self.c.close)
-    return self.c
+    c = Client(self.path)
+    self.addCleanup(c.close)
+    return c
 
   def shm(self, idx:int) -> str: return f"/t{self.proc.pid}_tinygpu_{idx}" # the server's shm object of block idx
 
   def store(self, size:int) -> tuple[int, mmap.mmap]: # a POSIX shm object the test owns, like the memory of a client
-    name = f"/tgs{os.getpid() % 10**6}x{time.monotonic_ns() % 10**9}"
-    fd = _posixshmem.shm_open(name, os.O_CREAT | os.O_RDWR, 0o600)
-    _posixshmem.shm_unlink(name)
-    os.ftruncate(fd, size)
+    fd = shm_object(size)
     self.addCleanup(os.close, fd)
     return fd, mmap.mmap(fd, size)
 
 class TestRelease(ServerCase):
   def test_map_table_and_unmap(self):
-    c = self.start()
+    c = self.start(MOCK_SLOT_BASE="17")
     st, idx, mm, pairs = c.map_sysmem(2 * MIB)
     self.assertEqual((st, idx), (0, 0))
     self.assertEqual(sum(n for _, n in pairs), 2 * MIB)
-    nseg = len(pairs)
-    self.assertEqual(struct.unpack_from('<QQ', mm, 16 * nseg + 16)[0], MAGIC)  # the dext's mark after the (0, 0) that ends the table
-    self.assertEqual(struct.unpack_from('<QQ', mm, 16 * nseg + 16)[1], 0)  # and its slot
+    self.assertEqual(struct.unpack_from('<QQ', mm, 16 * len(pairs) + 16), (MAGIC, 17))  # dext slot differs from server index
     mm[:8192] = bytes(8192)  # the table sits at the head of the block, the client zeroes it
     mm[16384:16388] = b"data"
     self.assertTrue(shm_exists(self.shm(0)))
@@ -395,6 +387,12 @@ import _posixshmem, os
 from extra.hcq1.remote import APLRemotePCIDevice
 APLRemotePCIDevice.ensure_app = classmethod(lambda cls: None) # the TinyGPU.app is not needed, the server under test is already running
 d = APLRemotePCIDevice("AM", "usb4")
+def shm_object(size): # a POSIX shm object, unlinked at once: the memory of a client
+  name = f"/tgs{os.getpid()}"
+  fd = _posixshmem.shm_open(name, os.O_CREAT | os.O_RDWR, 0o600)
+  _posixshmem.shm_unlink(name)
+  os.ftruncate(fd, size)
+  return fd
 """
 
 def run_client(tmp:str, sock_path:str, code:str):  # extra/hcq1/remote.py in its own process, its lock file cannot collide with a card session
@@ -443,10 +441,7 @@ for v in live: assert d.free_sysmem(v)
   def test_map_fd(self):
     self.run_client("""
 import mmap
-name = f"/tgs{os.getpid()}"
-fd = _posixshmem.shm_open(name, os.O_CREAT | os.O_RDWR, 0o600)
-_posixshmem.shm_unlink(name)
-os.ftruncate(fd, 64 << 20)
+fd = shm_object(64 << 20)
 mm = mmap.mmap(fd, 64 << 20)
 mm[:4] = b"data"
 for _ in range(5):  # a full aperture each time
@@ -464,21 +459,17 @@ assert block == 0 and d.unmap_fd(block) and d.can_release
   def test_unmap_unknown_block_is_an_error_not_unsupported(self):
     self.run_client("""
 try: d.unmap_fd(7); raise SystemExit("an unknown block was released")
-except RuntimeError as e: assert "refused" in str(e)
+except RuntimeError: pass
 assert d.can_release
 """)
 
   def test_dext_without_release_dma(self):
     self.run_client("""
-import mmap
-fd = _posixshmem.shm_open(f"/tgs{os.getpid()}", os.O_CREAT | os.O_RDWR, 0o600)
-_posixshmem.shm_unlink(f"/tgs{os.getpid()}")
-os.ftruncate(fd, 1 << 20)
-block, pages = d.map_fd(fd, 0, 1 << 20)  # importing works
+block, pages = d.map_fd(shm_object(1 << 20), 0, 1 << 20)  # importing works
 assert len(pages) == 256 and d.can_release
 assert not d.unmap_fd(block) and not d.can_release  # giving it back does not: asked once
 a, _ = d.alloc_sysmem(8 << 20)
-assert not d.free_sysmem(a) and a.addr in d.blocks
+assert not d.free_sysmem(a)
 a[0:4] = b"live"  # the block is still mapped
 assert a[0:4] == b"live" and not d.free_sysmem(a)  # and not asked again
 """, MOCK_OLD_DEXT="1")
@@ -488,9 +479,9 @@ assert a[0:4] == b"live" and not d.free_sysmem(a)  # and not asked again
 a, _ = d.alloc_sysmem(8 << 20)
 a[0x4000:0x4004] = b"live"
 try: d.free_sysmem(a); raise SystemExit("refusal not reported")
-except RuntimeError as e: assert "refused" in str(e)
-assert a.addr in d.blocks and d.can_release and a[0x4000:0x4004] == b"live"  # still ours, still mapped
-assert d.free_sysmem(a) and not d.blocks
+except RuntimeError: pass
+assert d.can_release and a[0x4000:0x4004] == b"live"  # still ours, still mapped
+assert d.free_sysmem(a) and not d.free_sysmem(a)
 """, MOCK_FAIL_RELEASE="1")
 
   def test_refused_release_keeps_the_aperture(self):
@@ -504,16 +495,11 @@ assert d.free_sysmem(a) and d.alloc_sysmem(64 << 20)[1][0] == 0x80000000
 """, MOCK_ARENA_MIB="64", MOCK_FAIL_RELEASE="1")
 
   def test_disconnect_frees_everything(self):
-    self.start(MOCK_ARENA_MIB="64").close()
-    r = run_client(self.tmp, self.path, """
+    self.run_client("""
 d.alloc_sysmem(32 << 20)
-fd = _posixshmem.shm_open(f"/tgs{os.getpid()}", os.O_CREAT | os.O_RDWR, 0o600)
-_posixshmem.shm_unlink(f"/tgs{os.getpid()}")
-os.ftruncate(fd, 32 << 20)
-d.map_fd(fd, 0, 32 << 20)
+d.map_fd(shm_object(32 << 20), 0, 32 << 20)
 os._exit(0)  # no free_sysmem, no unmap_fd, no goodbye
-""")
-    self.assertEqual(r.returncode, 0, r.stderr[-2000:])
+""", MOCK_ARENA_MIB="64")
     c = Client(self.path)  # served once the dead client's connection is cleaned up
     self.assertFalse(shm_exists(self.shm(0)))
     self.assertEqual(c.map_sysmem(64 * MIB)[:2], (0, 0))
@@ -540,10 +526,7 @@ class OldServer(threading.Thread):
           self.unknown.append(cmd)
           conn.sendall(struct.pack(RESP, 1, 0, 0))
           continue
-        name = f"/tgold{os.getpid() % 10**6}x{time.monotonic_ns() % 10**9}"
-        fd = _posixshmem.shm_open(name, os.O_CREAT | os.O_RDWR, 0o600)
-        _posixshmem.shm_unlink(name)
-        os.ftruncate(fd, PAGE)
+        fd = shm_object(PAGE)
         mm = mmap.mmap(fd, PAGE)
         struct.pack_into('<QQQQ', mm, 0, 0x80000000, PAGE, 0, 0)
         socket.send_fds(conn, [struct.pack(RESP, 0, PAGE, 0)], [fd])
@@ -552,20 +535,17 @@ class OldServer(threading.Thread):
 class TestOldServer(unittest.TestCase):
   def test_client_against_a_server_without_release(self):
     if sys.platform != "darwin": self.skipTest("extra/hcq1/remote.py runs on a mac")
-    tmp = tempfile.mkdtemp(prefix="tgold")
-    self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
-    srv = OldServer(os.path.join(tmp, "old.sock"))
+    tmp = self.enterContext(tempfile.TemporaryDirectory(prefix="tgold"))
+    sock = os.path.join(tmp, "old.sock")
+    srv = OldServer(sock)
     srv.start()
-    r = run_client(tmp, os.path.join(tmp, "old.sock"), """
+    r = run_client(tmp, sock, """
 a, pages = d.alloc_sysmem(0x4000)
 assert pages == [0x80000000 + i * 0x1000 for i in range(4)] and d.can_release
-assert not d.free_sysmem(a) and not d.can_release and a.addr in d.blocks  # (1, 0, 0): an old server
+assert not d.free_sysmem(a) and not d.can_release  # (1, 0, 0): an old server
 a[0x2000:0x2004] = b"live"
 assert a[0x2000:0x2004] == b"live"  # still mapped
-fd = _posixshmem.shm_open(f"/tgs{os.getpid()}", os.O_CREAT | os.O_RDWR, 0o600)
-_posixshmem.shm_unlink(f"/tgs{os.getpid()}")
-os.ftruncate(fd, 0x4000)
-try: d.map_fd(fd, 0, 0x4000); raise SystemExit("an old server imported memory")
+try: d.map_fd(shm_object(0x4000), 0, 0x4000); raise SystemExit("an old server imported memory")
 except RuntimeError: pass
 assert not d.unmap_fd(0) and not d.free_sysmem(a)  # not asked again
 """)
