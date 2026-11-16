@@ -2,7 +2,7 @@
 # Exercise the real server, C stress client and opt-in Python consumer without IOKit, a dext or a GPU (macOS only).
 # Run: python3 -m pytest -n12 extra/usbgpu/tbgpu/server_test/test_ring.py
 # TINYGPU_TEST_SERVER_C selects an older server source for the regression red gate.
-import contextlib, ctypes, functools, glob, mmap, os, random, shutil, socket, struct, subprocess, sys, tempfile, threading, time, unittest, atexit
+import contextlib, ctypes, functools, mmap, os, random, shutil, socket, struct, subprocess, sys, tempfile, threading, time, unittest, atexit
 from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -26,26 +26,14 @@ def wait_until(cond, timeout:float=10.0, what:str="the condition"):
 def ring_caps(m, caps:dict[str, int]):  # the sizes of the rings TinyGPURing.open will ask for
   return patch.multiple(m.TinyGPURing, **caps) if caps else contextlib.nullcontext()
 
-def compile_c(args:list[str]) -> str|None:  # None: built, else what the compiler said
-  clt = "/Library/Developer/CommandLineTools"
-  sdks = sorted(glob.glob(f"{clt}/SDKs/MacOSX*.sdk"))
-  tries = [["xcrun", "clang"]]
-  if sdks: tries.append([f"{clt}/usr/bin/clang", "-isysroot", sdks[-1]])  # works while the Xcode license is not accepted
-  err = ""
-  for cc in tries:
-    r = subprocess.run([*cc, "-O2", *args], capture_output=True, text=True)
-    if r.returncode == 0: return None
-    err = r.stderr[-3000:]
-  return err
-
 @functools.cache
 def binary(name:str) -> str:  # built once per process, in its own directory
   tmp = tempfile.mkdtemp(prefix="tgring_bin")
   atexit.register(shutil.rmtree, tmp, ignore_errors=True)
   dst = os.path.join(tmp, name)
-  srcs = ([SERVER_C, os.path.join(HERE, "mock_iokit.c"), os.path.join(HERE, "mock_main.c")] if name == "server"
+  srcs = ([SERVER_C, os.path.join(HERE, "mock_ring_iokit.c"), os.path.join(HERE, "mock_main.c")] if name == "server"
           else [os.path.join(HERE, "ring_stress.c")])
-  if (err := compile_c(["-o", dst, *srcs])) is not None: raise RuntimeError(f"cannot build {name}: {err}")
+  subprocess.run(["xcrun", "clang", "-O2", "-o", dst, *srcs], check=True)
   return dst
 
 class Client:
@@ -760,9 +748,8 @@ class FakeServer:
 
   def answer_later(self, status:int, r0:int, r1:int, data:bytes=b""):  # when the next request has arrived
     def run():
-      with contextlib.suppress(TimeoutError):
-        self.wait_requests(1)
-        self.answer(status, r0, r1, data)
+      self.wait_requests(1)
+      self.answer(status, r0, r1, data)
     threading.Thread(target=run, daemon=True).start()
 
   def drop(self):

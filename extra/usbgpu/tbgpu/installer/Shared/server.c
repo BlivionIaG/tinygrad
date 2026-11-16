@@ -82,6 +82,7 @@ typedef struct { uint8_t status; uint64_t resp0, resp1; } __attribute__((packed)
 #define RING_MAGIC 0x5447524E47000001ull // "TGRNG", version 1
 #define RING_SPIN_NS 200000ull           // how long the server polls the ring after the last request before it sleeps
 #define RING_STALL_NS 30000000000ull     // how long it waits for a client that does not move a ring word
+#define RING_READ_CHUNK (64 << 10)       // publish progress during slow BAR reads, not only after the whole payload
 #define KR_BAD_ARGUMENT 0xE00002C2u      // kIOReturnBadArgument
 #define KR_BUSY         0xE00002D5u      // kIOReturnBusy
 
@@ -391,9 +392,15 @@ static int ring_handle(int fd, const request_t *req) {
     return 0; // posted: no answer
   case CMD_MMIO_READ:
     if (validate_bar(req->bar, req->arg0, req->arg1)) { resp.status = 1; break; }
-    mmio_copy(g_bulk_buf, (void*)(g_bars[req->bar].addr + req->arg0), req->arg1);
     resp.resp0 = req->arg1;
-    return ring_push(fd, &resp, sizeof(resp), g_bulk_buf, req->arg1);
+    if (ring_push(fd, &resp, sizeof(resp), NULL, 0)) return -1;
+    for (uint64_t off = 0; off < req->arg1; ) {
+      size_t n = req->arg1 - off < RING_READ_CHUNK ? req->arg1 - off : RING_READ_CHUNK;
+      mmio_copy(g_bulk_buf, (void*)(g_bars[req->bar].addr + req->arg0 + off), n);
+      if (ring_push(fd, g_bulk_buf, n, NULL, 0)) return -1;
+      off += n;
+    }
+    return 0;
   default:
     if (!simple_cmd(req, &resp)) resp.status = 1; // everything that needs the socket (fds, features, ring setup) is refused here, like an unknown command
   }
