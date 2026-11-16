@@ -32,7 +32,20 @@ struct TinyGPUDriverUserClient_IVars
 		dmaCap = newCap;
 		return 0;
 	}
+
+	// a slot for a new PrepareDMA mapping: the lowest one ReleaseDMA emptied, else a new one at the end (not committed until dmas[slot] is written)
+	int findDMASlot(size_t *slot)
+	{
+		for (size_t i = 0; i < dmaCount; i++) {
+			if (!dmas[i].dmaCmd && !dmas[i].sharedBuf) { *slot = i; return 0; }
+		}
+		*slot = dmaCount;
+		return ensureDMACap(dmaCount + 1);
+	}
 };
+
+// PrepareDMA appends these two words after the (0, 0) that ends its address table: a server that sees the magic knows ReleaseDMA exists and which slot to name
+static const uint64_t kReleaseDMAMagic = 0x52454C444D410001ull;
 
 bool TinyGPUDriverUserClient::init()
 {
@@ -135,7 +148,8 @@ kern_return_t TinyGPUDriverUserClient::ExternalMethod(uint64_t selector, IOUserC
 			os_log(OS_LOG_DEFAULT, "tinygpu: PrepareDMA requires buffers >= 4097 bytes");
 			return kIOReturnBadArgument;
 		}
-		if (ivars->ensureDMACap(ivars->dmaCount + 1)) return kIOReturnNoMemory;
+		size_t slot = 0;
+		if (ivars->findDMASlot(&slot)) return kIOReturnNoMemory;
 
 		uint64_t size = 0;
 		args->structureInputDescriptor->GetLength(&size);
@@ -154,10 +168,25 @@ kern_return_t TinyGPUDriverUserClient::ExternalMethod(uint64_t selector, IOUserC
 		uint64_t* out = (uint64_t*)outMap->GetAddress();
 		for (uint32_t i = 0; i < segCount; i++) { out[i * 2] = segments[i].address; out[i * 2 + 1] = segments[i].length; }
 		out[segCount * 2] = 0; out[segCount * 2 + 1] = 0;
+		out[segCount * 2 + 2] = kReleaseDMAMagic; out[segCount * 2 + 3] = slot;
 		outMap->release();
 
-		os_log(OS_LOG_DEFAULT, "tinygpu: PrepareDMA size=%llu segs=%u", size, segCount);
-		ivars->dmas[ivars->dmaCount++] = {nullptr, dmaCmd};
+		os_log(OS_LOG_DEFAULT, "tinygpu: PrepareDMA size=%llu segs=%u slot=%zu", size, segCount, slot);
+		ivars->dmas[slot] = {nullptr, dmaCmd};
+		if (slot == ivars->dmaCount) ivars->dmaCount++;
+		return kIOReturnSuccess;
+	} else if (selector == TinyGPURPC::ReleaseDMA) {
+		// scalar in[0] = the slot PrepareDMA reported: gives the mapping back (DART unmap). The caller guarantees the device no longer uses it.
+		if (args->scalarInputCount != 1) return kIOReturnBadArgument;
+		uint64_t slot = args->scalarInput[0];
+		if (slot >= ivars->dmaCount) return kIOReturnBadArgument;
+		auto &d = ivars->dmas[slot];
+		if (!d.dmaCmd || d.sharedBuf) return kIOReturnBadArgument; // empty, or made by CreateDMA (those live until the client closes)
+		err = d.dmaCmd->CompleteDMA(kIODMACommandCompleteDMANoOptions);
+		if (err) { os_log(OS_LOG_DEFAULT, "tinygpu: ReleaseDMA slot=%llu failed err=%d", slot, err); return err; } // still mapped, still ours
+		d.dmaCmd->release();
+		d.dmaCmd = nullptr;
+		os_log(OS_LOG_DEFAULT, "tinygpu: ReleaseDMA slot=%llu", slot);
 		return kIOReturnSuccess;
 	}
 
